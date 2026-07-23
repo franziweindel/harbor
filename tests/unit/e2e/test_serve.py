@@ -98,6 +98,13 @@ def provider(tmp_path, **overrides) -> MarinServeProvider:
     return MarinServeProvider(**{**kwargs, **overrides})
 
 
+def test_command_serves_the_model_through_the_iris_subcommand(tmp_path):
+    command = provider(tmp_path)._command()
+
+    # marin-serve's grouped CLI takes the model as the argument of its `iris` subcommand.
+    assert command[:3] == [str(tmp_path / "marin-serve"), "iris", "Qwen/Qwen3-0.6B"]
+
+
 def test_provider_serves_the_capability_url_and_stops_the_slice(
     tmp_path, endpoint, fake_marin_serve, fake_iris
 ):
