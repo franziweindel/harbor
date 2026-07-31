@@ -43,6 +43,9 @@ TaskIdType = GitTaskId | LocalTaskId | PackageTaskId
 # already guard against, but at the per-trial agent.kwargs level. Excluded from the
 # equality key ONLY; the real values are still serialized into lock.json for audit.
 _VOLATILE_AGENT_KWARG_KEYS = frozenset({"api_base", "key"})
+# Environment cache-acquisition kwargs (the Daytona snapshot trio) are defined
+# alongside the resume identity fingerprint they must stay in sync with: see
+# ``TrialConfig._PROVISIONING_ENV_KWARG_KEYS`` in harbor_config.
 
 
 class TaskDownloadResolution(Protocol):
@@ -185,7 +188,7 @@ class TrialLock(BaseModel):
             _lock_list_equality_key(self.extra_instructions),
             _agent_equality_key(self.agent),
             tuple(skill._equality_key() for skill in self.skills),
-            _frozen_value(self.environment, exclude={"extra_docker_compose"}),
+            _environment_equality_key(self.environment),
             _lock_list_equality_key(self.extra_docker_compose),
             _frozen_value(self.verifier),
         )
@@ -269,29 +272,38 @@ def _frozen_value(value: Any, exclude: set[str] | None = None) -> Any:
     return value
 
 
-def _agent_equality_key(agent: AgentConfig) -> Any:
-    """Frozen equality key for a trial's agent, excluding per-allocation runtime
-    endpoint kwargs (see ``_VOLATILE_AGENT_KWARG_KEYS``).
-
-    ``skills`` are already keyed separately in ``TrialLock._equality_key`` (and so
-    excluded here, as before). The served-model ``api_base``/``key`` legitimately
-    change across a resume's SLURM allocation, so they must NOT contribute to lock
-    identity — otherwise every cross-allocation resume false-rejects in
-    ``Job._write_job_lock``. We strip those keys from a copy of ``kwargs`` for the
-    comparison only; serialization (what lands in lock.json) is unchanged.
+def _kwargs_stripped_frozen_key(
+    model: AgentConfig | EnvironmentConfig,
+    strip_keys: frozenset[str],
+    exclude: set[str],
+) -> Any:
+    """Frozen equality key for a config model, ignoring selected ``kwargs`` keys
+    that are non-replay runtime/provisioning knobs (``_VOLATILE_AGENT_KWARG_KEYS``
+    for the agent, ``TrialConfig._PROVISIONING_ENV_KWARG_KEYS`` for the
+    environment). Those keys change how a trial is served or provisioned, not
+    what it evaluates, so a resume must re-resolve the same lock. The real
+    values still serialize into lock.json; only the comparison ignores them.
     """
-    if not (agent.kwargs and _VOLATILE_AGENT_KWARG_KEYS.intersection(agent.kwargs)):
-        return _frozen_value(agent, exclude={"skills"})
-    sanitized = agent.model_copy(
+    if not (model.kwargs and strip_keys.intersection(model.kwargs)):
+        return _frozen_value(model, exclude=exclude)
+    sanitized = model.model_copy(
         update={
-            "kwargs": {
-                k: v
-                for k, v in agent.kwargs.items()
-                if k not in _VOLATILE_AGENT_KWARG_KEYS
-            }
+            "kwargs": {k: v for k, v in model.kwargs.items() if k not in strip_keys}
         }
     )
-    return _frozen_value(sanitized, exclude={"skills"})
+    return _frozen_value(sanitized, exclude=exclude)
+
+
+def _agent_equality_key(agent: AgentConfig) -> Any:
+    return _kwargs_stripped_frozen_key(agent, _VOLATILE_AGENT_KWARG_KEYS, {"skills"})
+
+
+def _environment_equality_key(environment: EnvironmentConfig) -> Any:
+    return _kwargs_stripped_frozen_key(
+        environment,
+        TrialConfig._PROVISIONING_ENV_KWARG_KEYS,
+        {"extra_docker_compose"},
+    )
 
 
 def build_job_lock(
