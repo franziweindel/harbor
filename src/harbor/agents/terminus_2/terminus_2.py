@@ -485,6 +485,11 @@ class Terminus2(BaseAgent):
         self._summarization_count: int = (
             0  # Track number of summarization subagents created
         )
+        self._continuation_segments_persisted: int = (
+            0  # Completed trajectory boundary dumps (canonical index of the
+            # current in-memory segment); diverges from _summarization_count
+            # when summarization is attempted but the boundary dump is skipped.
+        )
         self._pending_subagent_refs: list[SubagentTrajectoryRef] | None = (
             None  # Track subagent refs to include in next step
         )
@@ -2203,6 +2208,7 @@ so ask everything you need to know."""
         self._api_request_times = []
         self._n_episodes = 0
         self._summarization_count = 0
+        self._continuation_segments_persisted = 0
         self._subagent_metrics = SubagentMetrics()
         self._subagent_rollout_details = []
         self._pending_completion = False
@@ -2310,7 +2316,7 @@ so ask everything you need to know."""
             # (success, timeout/cancellation, error). Enqueue-only — no await —
             # so cancellation cannot interrupt it; Trial._finalize flushes the
             # artifact writer before the trial result is finalized.
-            self._persist_trajectory(self._summarization_count)
+            self._persist_final_trajectory()
 
     # ===== Trajectory-related helper functions =====
 
@@ -2535,15 +2541,16 @@ so ask everything you need to know."""
         Args:
             handoff_prompt: The handoff prompt containing answers
         """
-        # Save current trajectory segment before creating a continuation
-        # When _summarization_count is 1, dump to trajectory.json (continuation_index = 0)
-        # When _summarization_count is 2, dump to trajectory.cont-1.json (continuation_index = 1)
+        # Save current trajectory segment before creating a continuation.
         # This boundary dump is MANDATORY regardless of trajectory_dump_cadence:
         # the steps below are truncated from memory right after, so this segment
         # exists nowhere else. _persist_trajectory snapshots the step list on
         # this thread before the reset, then serializes + writes in the
-        # background artifact writer.
-        self._persist_trajectory(self._summarization_count - 1)
+        # background artifact writer. The continuation index is the number of
+        # boundary dumps already completed (_continuation_segments_persisted),
+        # advanced after this dump so a later exit writes the next segment.
+        self._persist_trajectory(self._continuation_segments_persisted, continued=True)
+        self._continuation_segments_persisted += 1
 
         # Create new session_id for continuation
         self._session_id = (
@@ -2560,7 +2567,7 @@ so ask everything you need to know."""
             )
 
     def _build_trajectory(
-        self, continuation_index: int
+        self, continuation_index: int, *, continued: bool = False
     ) -> tuple[Trajectory, Path | UPath] | None:
         """Build the trajectory model + destination path for a dump.
 
@@ -2574,6 +2581,9 @@ so ask everything you need to know."""
             continuation_index: The continuation index to use for filename and metadata.
                                For the initial trajectory, use 0.
                                For the first continuation, use 1, etc.
+            continued: Whether a later segment follows this one (boundary dump
+                       during a completed split). The final exit-path dump and
+                       per-turn snapshots pass False: no continuation follows.
         """
         if not self._context:
             self.logger.debug("No context available, skipping trajectory dump")
@@ -2597,12 +2607,12 @@ so ask everything you need to know."""
         if self._linear_history and continuation_index > 0:
             agent_extra["continuation_index"] = continuation_index
 
-        # Determine if this trajectory will be continued
-        # In linear_history mode, when saving during summarization (i.e., continuation_index < _summarization_count),
-        # this trajectory will have a continuation
+        # A continuation ref is only correct when this dump is the boundary
+        # segment that a completed split is carving a follow-up out of. The
+        # final exit-path dump is the last segment; an interrupted summarization
+        # has no follow-up even though _summarization_count was incremented.
         continued_trajectory_ref = None
-        if self._linear_history and continuation_index < self._summarization_count:
-            # This trajectory segment will be continued in the next file
+        if self._linear_history and continued:
             next_continuation_index = continuation_index + 1
             continued_trajectory_ref = f"trajectory.cont-{next_continuation_index}.json"
 
@@ -2628,7 +2638,9 @@ so ask everything you need to know."""
             trajectory_path = self.logs_dir / "trajectory.json"
         return trajectory, trajectory_path
 
-    def _persist_trajectory(self, continuation_index: int) -> None:
+    def _persist_trajectory(
+        self, continuation_index: int, *, continued: bool = False
+    ) -> None:
         """Enqueue a trajectory dump on the background artifact writer.
 
         Non-blocking for the caller: the writer's own small worker pool runs
@@ -2641,7 +2653,7 @@ so ask everything you need to know."""
         raise here; durability comes from the trial finalize flush
         (Trial._finalize -> ArtifactWriter.aflush).
         """
-        built = self._build_trajectory(continuation_index)
+        built = self._build_trajectory(continuation_index, continued=continued)
         if built is None:
             return
         trajectory, trajectory_path = built
@@ -2651,6 +2663,16 @@ so ask everything you need to know."""
             description=f"terminus-2 {trajectory_path.name}",
         )
 
+    def _persist_final_trajectory(self) -> None:
+        """Persist the final in-memory trajectory segment on every run() exit.
+
+        Uses the completed boundary-dump count as the continuation index: when
+        no split completed (including a summarization cancelled mid-flight) the
+        full conversation lands in the canonical ``trajectory.json``; after a
+        completed split it lands in the next ``trajectory.cont-N.json``.
+        """
+        self._persist_trajectory(self._continuation_segments_persisted)
+
     def _maybe_persist_trajectory_per_turn(self) -> None:
         """Per-episode dump hook: no-op unless cadence is PER_TURN.
 
@@ -2659,7 +2681,7 @@ so ask everything you need to know."""
         the per-turn cross-region write that collapsed rollout throughput.
         """
         if self._trajectory_dump_cadence is TrajectoryDumpCadence.PER_TURN:
-            self._persist_trajectory(self._summarization_count)
+            self._persist_trajectory(self._continuation_segments_persisted)
 
     # TODO: Add asciinema logging
     def _record_asciinema_marker(self, marker_text: str) -> None:
