@@ -7,6 +7,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     field_serializer,
     field_validator,
     model_validator,
@@ -253,6 +254,22 @@ class RetryConfig(BaseModel):
     )
 
 
+_TELEMETRY_FIELD_MAX_LENGTH = 4096
+
+
+class TelemetryConfig(BaseModel):
+    """Explicit Finelog export and stable run identity."""
+
+    endpoint: SecretStr = Field(min_length=1, max_length=_TELEMETRY_FIELD_MAX_LENGTH)
+    root_run_uid: str = Field(min_length=1, max_length=_TELEMETRY_FIELD_MAX_LENGTH)
+    execution_uid: str = Field(min_length=1, max_length=_TELEMETRY_FIELD_MAX_LENGTH)
+    serving_job_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=_TELEMETRY_FIELD_MAX_LENGTH,
+    )
+
+
 class JobConfig(BaseModel):
     # If replay-affecting fields are added or changed here, update JobLock in
     # harbor.models.job.lock so lock.json records the same resolved run input.
@@ -283,6 +300,7 @@ class JobConfig(BaseModel):
             "for RL, which reads rollout_details from the returned results."
         ),
     )
+    telemetry: TelemetryConfig | None = Field(default=None, exclude=True, repr=False)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
@@ -352,5 +370,5 @@ class JobConfig(BaseModel):
             return NotImplemented
 
         # Exclude non-replay identity/logging fields from equality comparison.
-        exclude = {"job_name", "debug"}
+        exclude = {"job_name", "debug", "telemetry"}
         return self.model_dump(exclude=exclude) == other.model_dump(exclude=exclude)
