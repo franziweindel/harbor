@@ -68,6 +68,7 @@ _ERROR_CATEGORIES: dict[str, ErrorCategory] = {
     "AgentKilledBySignalError": ErrorCategory.INFRASTRUCTURE,
     "AgentSetupTimeoutError": ErrorCategory.INFRASTRUCTURE,
     "ModelAuthenticationError": ErrorCategory.INFRASTRUCTURE,
+    "ContextBudgetExceededError": ErrorCategory.INFRASTRUCTURE,
     # --- Verifier infrastructure ---
     "DownloadVerifierDirError": ErrorCategory.INFRASTRUCTURE,
     "RewardFileNotFoundError": ErrorCategory.INFRASTRUCTURE,
@@ -96,6 +97,7 @@ _RESUME_RETRYABLE_ERROR_TYPES: frozenset[str] = frozenset(
     {
         "CancelledError",
         "SandboxBuildFailedError",
+        "ContextBudgetExceededError",
         "ContextManagementInfrastructureError",
     }
 )

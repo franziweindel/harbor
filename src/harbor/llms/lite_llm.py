@@ -46,8 +46,8 @@ from tenacity import (
 from harbor.literal import extract_literal_from_response
 from harbor.llms.base import (
     BaseLLM,
+    ContextBudgetExceededError,
     ContextLengthExceededError,
-    ContextManagementInfrastructureError,
     LLMResponse,
     OutputLengthExceededError,
 )
@@ -659,6 +659,7 @@ class LiteLLM(BaseLLM):
             & retry_if_not_exception_type(
                 (
                     ContextLengthExceededError,
+                    ContextBudgetExceededError,
                     OutputLengthExceededError,
                     openai.AuthenticationError,
                 )
@@ -740,24 +741,15 @@ class LiteLLM(BaseLLM):
                 kwargs["extra_body"] = {**kwargs["extra_body"]}
             completion_kwargs.update(kwargs)
 
-            # Clamp a non-positive output budget up to 1 token.
-            #
-            # A context-exhausted trial can drive max_tokens to 0 (or negative);
-            # vLLM then rejects with `max_tokens must be at least 1, got 0`
-            # (HTTP 400). Clamping to >=1 lets the call return a (short)
-            # completion / natural finish_reason so the trial winds down cleanly.
+            # Reject an invalid output budget before dispatch. Clamping it to one
+            # token hides the budgeting defect and produces a predictably unusable
+            # completion instead of a truthful typed failure.
             if completion_kwargs.get("max_tokens") is not None:
-                try:
-                    if completion_kwargs["max_tokens"] < 1:
-                        self._logger.warning(
-                            "Computed max_tokens="
-                            f"{completion_kwargs['max_tokens']} <= 0 (context "
-                            "budget exhausted); clamping to 1 to avoid a 400 "
-                            "'max_tokens must be at least 1' crash."
-                        )
-                        completion_kwargs["max_tokens"] = 1
-                except TypeError:
-                    pass
+                if completion_kwargs["max_tokens"] < 1:
+                    raise ContextBudgetExceededError(
+                        f"max_tokens must be positive, got "
+                        f"{completion_kwargs['max_tokens']}"
+                    )
 
             # Add thinking parameter for Anthropic models if max_thinking_tokens
             # is set. `thinking` is not an openai chat param, so it rides in
@@ -1127,11 +1119,7 @@ class LiteLLM(BaseLLM):
             if self._is_context_length_error(e):
                 raise ContextLengthExceededError from e
             if self._is_context_budget_exhausted_error(e):
-                raise ContextManagementInfrastructureError(
-                    "Request reached the provider with an effective max_tokens of "
-                    "zero (context budget exhausted); Harbor failed to recover a "
-                    "valid output budget before dispatch."
-                ) from e
+                raise ContextBudgetExceededError from e
         # openai surfaces vLLM's context-window rejections as a 400 BadRequest
         # (handled above); other APIStatusError subclasses may also carry a
         # context-length body, so string-check them too before re-raising.
@@ -1182,7 +1170,7 @@ class LiteLLM(BaseLLM):
     # structured 400. The distinctive, narrow signal is `param=max_tokens` with
     # `value=0` ("max_tokens must be at least 1, got 0"). Matching ONLY this
     # payload keeps a genuine misconfiguration (an unrelated 400) as
-    # BadRequestError rather than mislabelling it infrastructure.
+    # BadRequestError rather than mislabelling it as context exhaustion.
     _MAX_TOKENS_ZERO_PHRASES = (
         "max_tokens must be at least 1, got 0",
         "max_tokens must be at least 1, got -",  # negative budget variants

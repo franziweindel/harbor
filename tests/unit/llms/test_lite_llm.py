@@ -5,8 +5,8 @@ import openai
 import pytest
 
 from harbor.llms.base import (
+    ContextBudgetExceededError,
     ContextLengthExceededError,
-    ContextManagementInfrastructureError,
     OutputLengthExceededError,
 )
 from harbor.llms.chat import Chat
@@ -122,12 +122,10 @@ async def test_litellm_raises_context_length_for_bedrock_input_too_long():
 
 
 @pytest.mark.asyncio
-async def test_litellm_translates_max_tokens_zero_to_infra_exception():
+async def test_litellm_translates_max_tokens_zero_to_context_signal():
     """vLLM rejects a request whose effective output allowance is zero with a
     structured ``max_tokens must be at least 1, got 0`` 400. Harbor translates it
-    to ContextManagementInfrastructureError (not generic BadRequestError) and
-    preserves the provider error as the cause — a failed context-budget recovery
-    is infrastructure, not a model answer.
+    to ContextBudgetExceededError so it cannot be mistaken for input overflow.
     """
     llm = LiteLLM(model_name="fake-provider/some-model")
     payload = {
@@ -141,10 +139,19 @@ async def test_litellm_translates_max_tokens_zero_to_infra_exception():
     }
     _install_fake_chat(llm, raise_exc=_bad_request(str(payload), body=payload))
 
-    with pytest.raises(ContextManagementInfrastructureError) as exc_info:
+    with pytest.raises(ContextBudgetExceededError) as exc_info:
         await llm.call(prompt="hello", message_history=[])
 
     assert isinstance(exc_info.value.__cause__, openai.BadRequestError)
+
+
+@pytest.mark.asyncio
+async def test_litellm_rejects_nonpositive_output_budget_before_dispatch():
+    llm = LiteLLM(model_name="fake-provider/some-model")
+    _install_fake_chat(llm, raise_exc=AssertionError("transport was called"))
+
+    with pytest.raises(ContextBudgetExceededError, match="got 0"):
+        await llm.call(prompt="hello", message_history=[], max_tokens=0)
 
 
 @pytest.mark.asyncio

@@ -16,13 +16,14 @@ The fix makes truncation structurally impossible:
   * a self-correcting retry that GROWS the reserve (deeper unwind / more output
     headroom) on ``OutputLengthExceededError`` — the only direction that can
     satisfy a thinking model that spent the budget on reasoning tokens,
-  * a failed proactive recovery raises ``ContextManagementInfrastructureError``
-    instead of swallowing and dispatching the unchanged near-full chat,
-  * the LLM-free ultimate fallback logged at ``error`` (loud), last-resort only.
+  * provider rejection, rather than a guessed tokenizer margin, controls how
+    much copied history each concrete recovery request can carry,
+  * recovery is transactional and raises ``ContextManagementInfrastructureError``
+    instead of swallowing failures or dispatching the unchanged near-full chat.
 
-Parity invariant (G1): with ``enable_summarize=False`` the path is byte-identical
-to baseline — it raises ``ContextLengthExceededError`` within ``minimal_threshold``
-and issues ZERO summary LLM calls.
+With summarization disabled, the path raises
+``ContextLengthExceededError`` within ``minimal_threshold``, counts the pending
+prompt, and issues ZERO summary LLM calls.
 
 The tests bypass ``__init__`` via ``object.__new__`` and inject a fake LLM, the
 pattern used by the other terminus_2 unit tests.
@@ -35,9 +36,10 @@ import pytest
 
 from harbor.agents.terminus_2.terminus_2 import (
     RESERVED_SUMMARY_OUTPUT,
-    SUMMARY_CONTEXT_SAFETY_MARGIN,
     Terminus2,
+    _accepted_trajectory_step_count,
 )
+from harbor.context_management import ContextWindowManager
 from harbor.llms.base import (
     ContextLengthExceededError,
     ContextManagementInfrastructureError,
@@ -140,20 +142,21 @@ class WindowAwareFakeLLM:
         return _det_tokens(len(history), self._per_msg, len(prompt))
 
     async def call(self, prompt: str, message_history=None, **kwargs) -> LLMResponse:
-        self.calls.append(
-            {
-                "prompt": prompt,
-                "kwargs": dict(kwargs),
-                "message_history": list(message_history or []),
-            }
-        )
+        call = {
+            "prompt": prompt,
+            "kwargs": dict(kwargs),
+            "message_history": list(message_history or []),
+        }
+        self.calls.append(call)
         input_tokens = self._input_tokens(prompt, message_history)
         max_tokens = kwargs.get("max_tokens") or 0
-        if (
+        rejected = (
             self._always_overflow
             or input_tokens + max_tokens + self._request_overhead_tokens
             > self._context_limit
-        ):
+        )
+        call["accepted"] = not rejected
+        if rejected:
             raise ContextLengthExceededError(
                 f"This model's maximum context length is {self._context_limit} "
                 f"tokens. However, your request has {input_tokens + max_tokens} "
@@ -187,6 +190,7 @@ def _make_agent(
     agent = object.__new__(Terminus2)
     agent.logger = logging.getLogger("test-terminus-2-summary-budget")
     agent._llm = fake_llm
+    agent._context_window_manager = ContextWindowManager(fake_llm)
     agent._llm_call_kwargs = {}
     agent._enable_summarize = enable_summarize
     agent._proactive_summarization_threshold = proactive_threshold
@@ -299,6 +303,17 @@ async def test_flag_off_above_minimal_threshold_is_noop_no_llm_calls():
 # --------------------------------------------------------------------------- #
 
 
+def test_accepted_answer_history_keeps_its_two_copied_summary_steps():
+    parent_history_length = 9
+
+    accepted_steps = _accepted_trajectory_step_count(
+        accepted_history_length=parent_history_length + 2,
+        parent_history_length=parent_history_length,
+    )
+
+    assert accepted_steps == 7
+
+
 @pytest.mark.asyncio
 async def test_run_subagent_forwards_max_tokens_to_llm_call():
     """_run_subagent must forward an explicit max_tokens to _llm.call.
@@ -336,10 +351,9 @@ async def test_run_subagent_forwards_max_tokens_to_llm_call():
     assert passed >= RESERVED_SUMMARY_OUTPUT
 
 
-def test_reserve_summary_output_budget_unwinds_to_leave_reserve():
-    """_reserve_summary_output_budget unwinds the chat until
-    context_limit - input_tokens >= RESERVED_SUMMARY_OUTPUT +
-    SUMMARY_CONTEXT_SAFETY_MARGIN, so the summary
+def test_summary_unwind_leaves_requested_output_reserve():
+    """The summary unwind removes chat history until
+    context_limit - input_tokens >= RESERVED_SUMMARY_OUTPUT, so the summary
     subagent always has real output headroom regardless of starting fullness.
     """
     context_limit = 32768
@@ -354,12 +368,12 @@ def test_reserve_summary_output_budget_unwinds_to_leave_reserve():
     # must unwind message pairs until >= RESERVED_SUMMARY_OUTPUT is free.
     chat = _FakeChat(n_messages=155)
 
-    agent._reserve_summary_output_budget(chat, RESERVED_SUMMARY_OUTPUT)
+    agent._unwind_messages_to_free_tokens(chat, RESERVED_SUMMARY_OUTPUT)
 
     free = context_limit - agent._count_total_tokens(chat)
-    assert free >= RESERVED_SUMMARY_OUTPUT + SUMMARY_CONTEXT_SAFETY_MARGIN, (
+    assert free >= RESERVED_SUMMARY_OUTPUT, (
         f"reserve helper left only {free} free tokens, "
-        f"need >= {RESERVED_SUMMARY_OUTPUT + SUMMARY_CONTEXT_SAFETY_MARGIN}"
+        f"need >= {RESERVED_SUMMARY_OUTPUT}"
     )
 
 
@@ -417,8 +431,10 @@ async def test_summarize_with_retry_exhausts_ladder_with_growing_reserves():
 
     chat = _FakeChat(n_messages=200)
 
-    with pytest.raises(OutputLengthExceededError):
+    with pytest.raises(ContextManagementInfrastructureError) as exc_info:
         await agent._summarize_with_retry(chat, "task", session=object())
+
+    assert isinstance(exc_info.value.__cause__, OutputLengthExceededError)
 
     reserves = [c["kwargs"].get("max_tokens") for c in fake_llm.calls]
     assert len(reserves) >= 2, f"expected retries, got reserves={reserves}"
@@ -501,18 +517,19 @@ async def test_summary_prompt_counted_in_unwind_so_request_fits_window():
 
 
 @pytest.mark.asyncio
-async def test_summary_reserve_survives_serving_template_accounting_delta():
-    """A provider-side token-count delta must not overflow an exact reserve.
+async def test_summary_retries_against_provider_accounting_until_request_fits():
+    """Recovery must use provider rejection as the admission authority.
 
-    vLLM's final chat-template rendering can exceed Harbor's ``/tokenize``
-    estimate. The safety margin keeps the final 16K reserve below a 32K served
-    context even when the provider counts additional request tokens.
+    A local tokenizer cannot reproduce an arbitrary serving chat template. A
+    fixed safety margin merely chooses one discrepancy to pass; the recovery
+    contract must keep reducing copied history until the provider accepts each
+    concrete summary request.
     """
     context_limit = 32768
     fake_llm = WindowAwareFakeLLM(
         context_limit=context_limit,
         per_msg_tokens=200,
-        request_overhead_tokens=4096,
+        request_overhead_tokens=5000,
     )
     agent = _make_agent(
         enable_summarize=True,
@@ -528,7 +545,62 @@ async def test_summary_reserve_survives_serving_template_accounting_delta():
     )
 
     assert summary_prompt
-    fake_llm.assert_no_over_window_request()
+    first_accepted = next(
+        index for index, call in enumerate(fake_llm.calls) if call["accepted"]
+    )
+    recovery_attempts = fake_llm.calls[: first_accepted + 1]
+    rejected_attempts = recovery_attempts[:-1]
+    history_lengths = [len(call["message_history"]) for call in recovery_attempts]
+    assert rejected_attempts
+    assert all(
+        later < earlier for earlier, later in zip(history_lengths, history_lengths[1:])
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_summary_does_not_mutate_live_conversation():
+    """A failed recovery attempt must roll back all history trimming."""
+    fake_llm = WindowAwareFakeLLM(
+        context_limit=32768,
+        per_msg_tokens=200,
+        always_overflow=True,
+    )
+    agent = _make_agent(
+        enable_summarize=True,
+        context_limit=32768,
+        per_msg_tokens=200,
+        fake_llm=fake_llm,
+    )
+    _stub_subagent_bookkeeping(agent)
+    chat = _FakeChat(n_messages=155)
+    original_messages = list(chat.messages)
+
+    with pytest.raises(ContextManagementInfrastructureError):
+        await agent._summarize_with_retry(chat, "task", session=_FakeSession())
+
+    assert chat.messages == original_messages
+
+
+@pytest.mark.asyncio
+async def test_pending_prompt_participates_in_proactive_context_budget():
+    """The next user prompt is part of the next request, not future context."""
+    fake_llm = FakeLLM(context_limit=32768)
+    agent = _make_agent(
+        enable_summarize=False,
+        context_limit=32768,
+        per_msg_tokens=200,
+        fake_llm=fake_llm,
+    )
+    chat = _FakeChat(n_messages=150)
+    pending_prompt = "x" * 8000
+
+    with pytest.raises(ContextLengthExceededError):
+        await agent._check_proactive_summarization(
+            chat,
+            "task",
+            session=None,
+            pending_prompt=pending_prompt,
+        )
 
 
 @pytest.mark.asyncio

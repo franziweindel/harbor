@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from collections.abc import Callable
-from typing import Any, Literal
+from collections.abc import Callable, Sequence
+from typing import Any, Literal, Protocol
 
 from upath import UPath
 
@@ -29,9 +29,16 @@ from harbor.agents.terminus_2.terminus_xml_plain_parser import (
     TerminusXMLPlainParser,
 )
 from harbor.agents.terminus_2.tmux_session import TmuxSession
+from harbor.context_management import (
+    ContextManagedResponse,
+    ContextWindowManager,
+    MESSAGES_PER_TURN,
+    trim_latest_turn,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.llms.base import (
     BaseLLM,
+    ContextBudgetExceededError,
     ContextLengthExceededError,
     ContextManagementInfrastructureError,
     LLMBackend,
@@ -161,14 +168,41 @@ def _get_shared_async_tokenize_client(timeout: float = 10.0):  # -> httpx.AsyncC
 # agent_logs/2026-07-31_escalation-harbor-terminus2-context-budget-failure.md.
 RESERVED_SUMMARY_OUTPUT = 4096
 _MAX_RESERVED_SUMMARY_OUTPUT = 16384
-# ``/tokenize`` and vLLM's rendered chat request can differ slightly because the
-# serving template owns final message serialization. Keep a fixed cushion so a
-# request at the apparent limit is never sent at the provider limit.
-# The direct vLLM ``/tokenize`` route is not universally available through
-# serving proxies. Its local-tokenizer fallback can miss several thousand
-# template and reasoning-control tokens, so keep a conservative reserve before
-# dispatching a summary request.
-SUMMARY_CONTEXT_SAFETY_MARGIN = 6144
+
+
+@dataclass(frozen=True)
+class SubagentRunResult:
+    response: LLMResponse
+    trajectory_ref: SubagentTrajectoryRef
+    accepted_history: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class EpisodeLoggingPaths:
+    debug: Path | UPath | None
+    prompt: Path | UPath | None
+    response: Path | UPath | None
+
+
+@dataclass(frozen=True)
+class LLMRequestContext:
+    logging_paths: EpisodeLoggingPaths
+    original_instruction: str
+    session: TmuxSession | None
+
+
+def _trajectory_step_count(message_history_length: int) -> int:
+    """Map system-plus-turn chat history to its parent trajectory slice."""
+    return 1 + (message_history_length - 1) // MESSAGES_PER_TURN
+
+
+def _accepted_trajectory_step_count(
+    *, accepted_history_length: int, parent_history_length: int
+) -> int:
+    """Map accepted parent chat and one-step-per-message suffixes to steps."""
+    accepted_parent_length = min(accepted_history_length, parent_history_length)
+    accepted_suffix_length = max(0, accepted_history_length - parent_history_length)
+    return _trajectory_step_count(accepted_parent_length) + accepted_suffix_length
 
 
 class TrajectoryDumpCadence(StrEnum):
@@ -212,6 +246,52 @@ def _enqueue_episode_text(path: Path | UPath, text: str) -> None:
 class Command:
     keystrokes: str
     duration_sec: float
+
+
+@dataclass(frozen=True)
+class LLMInteractionResult:
+    commands: list[Command]
+    is_task_complete: bool
+    feedback: str
+    analysis: str
+    plan: str
+    response: LLMResponse
+
+
+class ParsedCommand(Protocol):
+    @property
+    def keystrokes(self) -> str: ...
+
+    @property
+    def duration(self) -> float: ...
+
+
+class TerminusParseResult(Protocol):
+    @property
+    def commands(self) -> Sequence[ParsedCommand]: ...
+
+    @property
+    def is_task_complete(self) -> bool: ...
+
+    @property
+    def error(self) -> str: ...
+
+    @property
+    def warning(self) -> str: ...
+
+    @property
+    def analysis(self) -> str: ...
+
+    @property
+    def plan(self) -> str: ...
+
+
+class TerminusResponseParser(Protocol):
+    def parse_response(self, response: str) -> TerminusParseResult: ...
+
+    def salvage_truncated_response(self, truncated_response: str) -> str | None:
+        """Return text that remains valid after truncation, when available."""
+        ...
 
 
 @dataclass
@@ -442,6 +522,7 @@ class Terminus2(BaseAgent):
         self._prompt_template = self._get_prompt_template_path().read_text()
         self._timeout_template = self._get_timeout_template_path().read_text()
         self._temperature = temperature
+        self._context_window_manager = ContextWindowManager(self._llm)
 
         # Handle deprecated 'episodes' kwarg
         episodes_from_kwargs = kwargs.get("episodes")
@@ -578,7 +659,7 @@ class Terminus2(BaseAgent):
         )
         await self._session.start()
 
-    def _get_parser(self):
+    def _get_parser(self) -> TerminusResponseParser:
         """Return the appropriate parser instance for this format."""
         if self._parser_name == "json":
             return TerminusJSONPlainParser()
@@ -714,7 +795,7 @@ class Terminus2(BaseAgent):
 
     def _setup_episode_logging(
         self, logging_dir: Path | UPath | None, episode: int
-    ) -> tuple[Path | UPath | None, Path | UPath | None, Path | UPath | None]:
+    ) -> EpisodeLoggingPaths:
         # Default OFF: no per-turn episode-N/{debug,prompt,response} writes. This
         # returns all-None so `_query_llm` skips prompt/response writes AND the
         # per-call raw request+response `debug.json` is never written (LiteLLM.call
@@ -724,15 +805,15 @@ class Terminus2(BaseAgent):
         # unaffected (it reads rollout_details + trajectory.json, written
         # independently).
         if not self._enable_episode_logging:
-            return None, None, None
+            return EpisodeLoggingPaths(None, None, None)
         if logging_dir is None:
-            return None, None, None
+            return EpisodeLoggingPaths(None, None, None)
 
         episode_logging_dir = logging_dir / f"episode-{episode}"
         # No mkdir here: the artifact-writer worker creates local parent dirs
         # on write, and object stores need no directory at all — a remote mkdir
         # would be one more blocking round-trip on the event loop.
-        return (
+        return EpisodeLoggingPaths(
             episode_logging_dir / "debug.json",
             episode_logging_dir / "prompt.txt",
             episode_logging_dir / "response.txt",
@@ -935,7 +1016,7 @@ class Terminus2(BaseAgent):
     def _unwind_messages_to_free_tokens(
         self,
         chat: Chat,
-        target_free_tokens: int = 4000,
+        target_free_tokens: int,
         extra_request_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Remove recent messages until we have enough free tokens.
@@ -946,18 +1027,17 @@ class Terminus2(BaseAgent):
         """
         context_limit = self._llm.get_model_context_limit()
 
-        while len(chat.messages) > 1:  # Keep at least the first message
+        while True:
             current_tokens = self._count_total_tokens(chat, extra_request_messages)
             free_tokens = context_limit - current_tokens
 
             if free_tokens >= target_free_tokens:
                 break
 
-            # Remove the most recent pair of messages (user + assistant)
-            if len(chat.messages) >= 2:
-                chat._messages = chat.messages[:-2]
-            else:
+            trimmed_messages = trim_latest_turn(chat.messages)
+            if trimmed_messages is None:
                 break
+            chat._messages = trimmed_messages
 
         chat.reset_response_chain()
         free_tokens = context_limit - self._count_total_tokens(
@@ -1035,28 +1115,46 @@ class Terminus2(BaseAgent):
         request_time_ms = (end_time - start_time) * 1000
         self._api_request_times.append(request_time_ms)
 
+    async def _dispatch_subagent_request(
+        self,
+        *,
+        prompt: str,
+        message_history: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> ContextManagedResponse:
+        """Dispatch one context-managed subagent request and record its duration."""
+        call_kwargs = {
+            key: value
+            for key, value in self._llm_call_kwargs.items()
+            if key != "max_tokens"
+        }
+        start_time = time.time()
+        managed_response = await self._context_window_manager.call(
+            prompt=prompt,
+            message_history=message_history,
+            max_tokens=max_tokens,
+            call_kwargs=call_kwargs,
+        )
+        self._track_api_request_time(start_time)
+        return managed_response
+
     async def _run_subagent(
         self,
         prompt: str,
-        message_history: list[dict],
+        message_history: list[dict[str, Any]],
         steps: list[Step],
         session_id: str,
         agent_name: str,
         filename_suffix: str,
         summary_text: str,
+        max_tokens: int,
+        parent_history_length: int | None = None,
         subagent_name_for_logging: str = "subagent",
-        max_tokens: int | None = None,
-    ) -> tuple[LLMResponse, SubagentTrajectoryRef]:
-        """Run a subagent and return its response and trajectory reference.
+    ) -> SubagentRunResult:
+        """Run a subagent and return its response and trajectory.
 
-        This helper encapsulates the common pattern of:
-        1. Appending the prompt step to the trajectory
-        2. Calling the LLM with the prompt and message history
-        3. Tracking API request time
-        4. Updating subagent metrics
-        5. Appending the response step to the trajectory
-        6. Collecting rollout details
-        7. Saving the subagent trajectory
+        ``steps`` is truncated when necessary so its copied context matches the
+        history the provider accepted.
 
         Args:
             prompt: The prompt to send to the LLM
@@ -1067,15 +1165,28 @@ class Terminus2(BaseAgent):
             filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
             summary_text: Human-readable summary for the trajectory ref
             subagent_name_for_logging: Name used in logging messages
-            max_tokens: Explicit output-token budget for the LLM call. When set,
-                guarantees the summary completion cannot be silently truncated by
-                running out of output room (forwarded straight to
-                ``litellm.acompletion`` via ``lite_llm.call``'s ``**kwargs``).
-
+            max_tokens: Output-token budget for the LLM call. This guarantees the
+                summary completion cannot be silently truncated by running out of
+                output room.
+            parent_history_length: Length of the parent chat prefix. Messages after
+                this prefix correspond one-to-one with copied trajectory steps.
         Returns:
-            tuple: (LLM response, SubagentTrajectoryRef)
+            The response, saved trajectory reference, and provider-accepted history.
         """
-        # Append the prompt step
+        managed_response = await self._dispatch_subagent_request(
+            prompt=prompt,
+            message_history=message_history,
+            max_tokens=max_tokens,
+        )
+        response = managed_response.response
+        if parent_history_length is None:
+            parent_history_length = len(message_history)
+        accepted_steps = _accepted_trajectory_step_count(
+            accepted_history_length=len(managed_response.accepted_history),
+            parent_history_length=parent_history_length,
+        )
+        del steps[accepted_steps:]
+
         prompt_step_id = len(steps) + 1
         steps.append(
             Step(
@@ -1086,22 +1197,6 @@ class Terminus2(BaseAgent):
             )
         )
         response_step_id = prompt_step_id + 1
-
-        # Pass max_tokens explicitly when provided so the summary completion
-        # reserves real output headroom and cannot be truncated. An explicit
-        # value overrides any max_tokens in _llm_call_kwargs (the caller has
-        # computed the correct reserve against the current context margin).
-        call_kwargs = dict(self._llm_call_kwargs)
-        if max_tokens is not None:
-            call_kwargs["max_tokens"] = max_tokens
-
-        start_time = time.time()
-        response: LLMResponse = await self._llm.call(
-            prompt=prompt,
-            message_history=message_history,
-            **call_kwargs,
-        )
-        self._track_api_request_time(start_time)
 
         usage_info = response.usage
         self._update_subagent_metrics(usage_info)
@@ -1125,31 +1220,10 @@ class Terminus2(BaseAgent):
             summary_text=summary_text,
         )
 
-        return response, trajectory_ref
-
-    def _reserve_summary_output_budget(
-        self,
-        chat: Chat,
-        reserved_output: int,
-        extra_request_messages: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """Unwind ``chat`` until the summary request fits the model window.
-
-        Guarantees the summary subagent has real output headroom: after this
-        returns, ``context_limit - tokens(chat.messages + extra_request_messages)
-        >= reserved_output + SUMMARY_CONTEXT_SAFETY_MARGIN`` (subject to keeping
-        the first message).
-        ``extra_request_messages`` is the summary prompt itself — it is sent
-        alongside the retained history but lives outside ``chat.messages``, so
-        it must be counted here or the request overflows by exactly the prompt
-        size. This is the structural half of the truncation-proof contract —
-        the other half is passing ``reserved_output`` as an explicit
-        ``max_tokens`` on the call.
-        """
-        self._unwind_messages_to_free_tokens(
-            chat,
-            target_free_tokens=reserved_output + SUMMARY_CONTEXT_SAFETY_MARGIN,
-            extra_request_messages=extra_request_messages,
+        return SubagentRunResult(
+            response=response,
+            trajectory_ref=trajectory_ref,
+            accepted_history=managed_response.accepted_history,
         )
 
     async def _summarize_with_retry(
@@ -1163,49 +1237,50 @@ class Terminus2(BaseAgent):
         thinking-enabled model can still exhaust that allowance on reasoning
         tokens; when it does (``OutputLengthExceededError``) we retry with a
         LARGER reserve. A larger reserve both unwinds more input
-        (``_reserve_summary_output_budget`` frees ``reserve`` tokens) and grants
+        (history trimming frees ``reserve`` tokens) and grants
         more summary output headroom — the only direction that can satisfy a
         summary that ran out of space. The previous "shrink the reserve" ladder
         unwound less and granted less, guaranteeing re-truncation.
 
-        A ``ContextLengthExceededError`` from a summary subagent (the retained
-        history + summary prompt + chat-template overhead still overflowed) is
-        caught on the same ladder: a larger reserve unwinds more input, so the
-        retry fits. Exhausting the ladder on EITHER error surfaces it so the
-        caller turns the failure into a typed infrastructure exception rather
-        than persisting a scored ``ContextLengthExceededError`` model outcome.
+        Recovery is transactional: if any stage fails, the live conversation is
+        restored instead of retaining a partial unwind.
 
         The ladder is capped at the model's output limit
         (``_MAX_RESERVED_SUMMARY_OUTPUT`` when the limit is unknown) so the
         reserve never exceeds what the provider will generate.
 
         Returns ``_summarize``'s ``(handoff_prompt, subagent_refs)`` on success;
-        re-raises the last error only if every retry budget is exhausted.
+        raises ``ContextManagementInfrastructureError`` if recovery is exhausted.
         """
-        output_limit = self._llm.get_model_output_limit()
-        max_reserve = output_limit or _MAX_RESERVED_SUMMARY_OUTPUT
-        reserve = RESERVED_SUMMARY_OUTPUT
-        last_exc: Exception | None = None
-        while reserve <= max_reserve:
-            try:
-                return await self._summarize(
-                    chat, original_instruction, session, reserved_output=reserve
+        original_messages = list(chat.messages)
+        try:
+            output_limit = self._llm.get_model_output_limit()
+            max_reserve = output_limit or _MAX_RESERVED_SUMMARY_OUTPUT
+            if max_reserve < 1:
+                raise ContextManagementInfrastructureError(
+                    "Context recovery requires a positive output budget."
                 )
-            except (
-                OutputLengthExceededError,
-                ContextLengthExceededError,
-            ) as e:
-                last_exc = e
-                self.logger.warning(
-                    f"Summary generation failed at reserved_output={reserve} "
-                    f"({type(e).__name__}); retrying with a larger reserve / "
-                    f"deeper unwind."
-                )
-                reserve *= 2
-        # Exhausted the retry ladder — surface to the caller to fail loudly.
-        if last_exc is None:
-            raise RuntimeError("Summary retry loop exited without an exception")
-        raise last_exc
+            reserve = min(RESERVED_SUMMARY_OUTPUT, max_reserve)
+            last_error: OutputLengthExceededError | None = None
+            while True:
+                chat._messages = list(original_messages)
+                try:
+                    return await self._summarize(
+                        chat, original_instruction, session, reserved_output=reserve
+                    )
+                except OutputLengthExceededError as error:
+                    last_error = error
+                    next_reserve = min(reserve * 2, max_reserve)
+                    if next_reserve == reserve:
+                        break
+                    reserve = next_reserve
+            raise ContextManagementInfrastructureError(
+                "Context recovery exhausted the model's output budget."
+            ) from last_error
+        except Exception:
+            chat._messages = original_messages
+            chat.reset_response_chain()
+            raise
 
     async def _summarize(
         self,
@@ -1284,14 +1359,15 @@ Be comprehensive and detailed. The next agent needs to understand everything
         summary_overhead_messages = [{"role": "user", "content": summary_prompt}]
 
         # Guarantee output headroom BEFORE computing the trajectory slice: unwind
-        # the input so the summary completion has at least RESERVED_SUMMARY_OUTPUT
-        # free tokens counting the retained history PLUS the summary prompt, then
-        # pass that same reserve as an explicit max_tokens on every summary
-        # subagent call below. Together these make the summary structurally
-        # un-truncatable and the request fit the window regardless of how full
-        # the context was.
-        self._reserve_summary_output_budget(
-            chat, reserved_output, extra_request_messages=summary_overhead_messages
+        # the input so the summary completion has at least ``reserved_output`` free
+        # tokens counting the retained history PLUS the summary prompt, then pass
+        # that same reserve as an explicit max_tokens on every summary
+        # subagent call below. Provider rejection remains the final admission
+        # authority and can trim the copied history further.
+        self._unwind_messages_to_free_tokens(
+            chat,
+            target_free_tokens=reserved_output,
+            extra_request_messages=summary_overhead_messages,
         )
 
         # Increment summarization count
@@ -1308,13 +1384,12 @@ Be comprehensive and detailed. The next agent needs to understand everything
         # Calculate how many trajectory steps to include based on remaining chat messages:
         # - Chat has: [system, agent1, user1, agent2, user2, ...]
         # - Trajectory has: [step1_system, step2_agent, step3_agent, ...]
-        # - Formula: steps_to_include = 1 + (num_messages - 1) // 2
-        steps_to_include = 1 + (len(chat.messages) - 1) // 2
+        steps_to_include = _trajectory_step_count(len(chat.messages))
         summary_steps, step_id_counter = self._prepare_copied_trajectory_steps(
             steps_to_include
         )
 
-        summary_response, summary_trajectory_ref = await self._run_subagent(
+        summary_result = await self._run_subagent(
             prompt=summary_prompt,
             message_history=chat.messages,
             steps=summary_steps,
@@ -1325,7 +1400,9 @@ Be comprehensive and detailed. The next agent needs to understand everything
             subagent_name_for_logging="summary generation LLM call",
             max_tokens=reserved_output,
         )
-        subagent_trajectory_refs.append(summary_trajectory_ref)
+        chat._messages = summary_result.accepted_history
+        summary_response = summary_result.response
+        subagent_trajectory_refs.append(summary_result.trajectory_ref)
 
         # ===== SUBAGENT 2: Question Asking =====
         current_screen = await session.capture_pane(capture_entire=False)
@@ -1349,7 +1426,7 @@ about the current state of the solution that are not answered in the summary
 from the prior agent. After you ask these questions you will be on your own,
 so ask everything you need to know."""
 
-        questions_response, questions_trajectory_ref = await self._run_subagent(
+        questions_result = await self._run_subagent(
             prompt=question_prompt,
             message_history=[],
             steps=questions_steps,
@@ -1360,16 +1437,18 @@ so ask everything you need to know."""
             subagent_name_for_logging="questions subagent",
             max_tokens=reserved_output,
         )
+        questions_response = questions_result.response
         model_questions = questions_response.content
-        subagent_trajectory_refs.append(questions_trajectory_ref)
+        subagent_trajectory_refs.append(questions_result.trajectory_ref)
 
         # ===== SUBAGENT 3: Answer Providing =====
         answers_session_id = (
             f"{self._session_id}-summarization-{self._summarization_count}-answers"
         )
 
-        # Reuse the actual trajectory steps (same as summary subagent)
-        # At this point, chat.messages has the same unwound history as in summary subagent
+        # Reuse the exact trajectory accepted for the summary request. The
+        # provider may have trimmed more history than the local estimate.
+        steps_to_include = _trajectory_step_count(len(chat.messages))
         answers_steps, step_id_counter = self._prepare_copied_trajectory_steps(
             steps_to_include
         )
@@ -1414,7 +1493,7 @@ so ask everything you need to know."""
             {"role": "assistant", "content": summary_response.content},
         ]
 
-        answers_response, answers_trajectory_ref = await self._run_subagent(
+        answers_result = await self._run_subagent(
             prompt=answer_request_prompt,
             message_history=answers_message_history,
             steps=answers_steps,
@@ -1424,8 +1503,10 @@ so ask everything you need to know."""
             summary_text=f"Context summarization {self._summarization_count}: Step 3 - Answer providing",
             subagent_name_for_logging="answers subagent",
             max_tokens=reserved_output,
+            parent_history_length=len(chat.messages),
         )
-        subagent_trajectory_refs.append(answers_trajectory_ref)
+        answers_response = answers_result.response
+        subagent_trajectory_refs.append(answers_result.trajectory_ref)
 
         # Update chat history with the handoff context
         # Note: We only include questions, not answers. The answers will be provided
@@ -1449,13 +1530,18 @@ so ask everything you need to know."""
         return handoff_prompt, subagent_trajectory_refs
 
     async def _check_proactive_summarization(
-        self, chat: Chat, original_instruction: str, session: TmuxSession | None
+        self,
+        chat: Chat,
+        original_instruction: str,
+        session: TmuxSession | None,
+        pending_prompt: str = "",
     ) -> tuple[str, list[SubagentTrajectoryRef] | None] | None:
         """Check context length and either summarize or proactively raise.
 
         This method ALWAYS runs regardless of the ``enable_summarize`` setting so
         that we never dispatch a generation request that the inference engine will
-        reject for exceeding the context window.
+        reject for exceeding the context window. The estimate includes
+        ``pending_prompt`` because it will be part of the next request.
 
         - When ``enable_summarize=False`` (e.g. RL rollouts that keep raw traces):
           if the prompt is within ``minimal_threshold`` of the context limit, raise
@@ -1481,8 +1567,11 @@ so ask everything you need to know."""
                 of the context limit and summarization is disabled.
         """
         context_limit = self._llm.get_model_context_limit()
+        pending_messages = (
+            [{"role": "user", "content": pending_prompt}] if pending_prompt else None
+        )
         # Offloaded off the coordinator event loop (blocking httpx /tokenize POST).
-        current_tokens = await self._acount_total_tokens(chat)
+        current_tokens = await self._acount_total_tokens(chat, pending_messages)
         free_tokens = context_limit - current_tokens
 
         # When summarization is disabled, raise only once we've actually reached the
@@ -1505,41 +1594,22 @@ so ask everything you need to know."""
             )
             if session is None:
                 raise RuntimeError("Cannot summarize without session")
-            # Use the truncation-proof, self-correcting summarizer. On
-            # exhaustion it re-raises OutputLengthExceededError (output budget
-            # exhausted) or ContextLengthExceededError (the retained history +
-            # summary prompt still overflowed the window); we MUST NOT swallow
-            # either and fall through (returning None would leave the unchanged
-            # near-full chat active, so the next main-agent request dispatches
-            # with an effective max_tokens of zero and vLLM rejects it with a
-            # 400). Fail the trial as an infrastructure error instead so it is
-            # retried, not recorded as a model answer.
-            try:
-                (
-                    summary_prompt,
-                    subagent_trajectory_refs,
-                ) = await self._summarize_with_retry(
-                    chat, original_instruction, session
-                )
-                return (summary_prompt, subagent_trajectory_refs)
-            except (
-                OutputLengthExceededError,
-                ContextLengthExceededError,
-            ) as e:
-                raise ContextManagementInfrastructureError(
-                    "Proactive context summarization exhausted its output-budget "
-                    "recovery ladder; cannot continue without a valid request "
-                    f"budget (free tokens: approximately {free_tokens})."
-                ) from e
+            return await self._summarize_with_retry(chat, original_instruction, session)
 
         return None
 
     @retry(
         stop=stop_after_attempt(3),
-        # Do not retry since it is only raised when summarization is OFF, and we will
-        # likely hit the context length limit again despite retrying.
+        # Context-capacity and exhausted-recovery outcomes need a new conversation
+        # state or a new trial; repeating the identical call cannot resolve them.
         retry=(
-            retry_if_not_exception_type(ContextLengthExceededError)
+            retry_if_not_exception_type(
+                (
+                    ContextLengthExceededError,
+                    ContextBudgetExceededError,
+                    ContextManagementInfrastructureError,
+                )
+            )
             # To avoid asyncio.CancelledError retries which inherits from BaseException
             # rather than Exception
             & retry_if_exception_type(Exception)
@@ -1550,219 +1620,160 @@ so ask everything you need to know."""
         self,
         chat: Chat,
         prompt: str,
-        logging_paths: tuple[
-            Path | UPath | None, Path | UPath | None, Path | UPath | None
-        ],
-        original_instruction: str = "",
-        session: TmuxSession | None = None,
+        request_context: LLMRequestContext,
     ) -> LLMResponse:
-        logging_path, prompt_path, response_path = logging_paths
+        logging_paths = request_context.logging_paths
+        logging_path = logging_paths.debug
+        prompt_path = logging_paths.prompt
+        response_path = logging_paths.response
 
         if prompt_path is not None:
             _enqueue_episode_text(prompt_path, prompt)
 
         try:
-            start_time = time.time()
-            llm_response = await chat.chat(
-                prompt,
-                logging_path=logging_path,
-                **self._llm_call_kwargs,
+            return await self._dispatch_llm_request(
+                chat, prompt, logging_path, response_path
             )
-            end_time = time.time()
-            request_time_ms = (end_time - start_time) * 1000
-            self._api_request_times.append(request_time_ms)
 
-            if response_path is not None:
-                _enqueue_episode_text(response_path, llm_response.content)
-            return llm_response
-
-        except ContextLengthExceededError:
-            # First, we check whether we want to summarize or not
-            if not self._enable_summarize:
-                self.logger.debug("Context length exceeded and summarization is OFF.")
-                raise
-
-            self.logger.debug("Context length exceeded. Using fallback summarization.")
-
-            if session is None:
-                raise RuntimeError("Cannot handle context length error without session")
-
-            self._unwind_messages_to_free_tokens(chat, target_free_tokens=4000)
-
-            summary_prompt = None
-            # Fallback 1: Try full summary (truncation-proof, self-correcting).
-            try:
-                self.logger.debug("SUMMARIZATION: Attempting full summary")
-                (
-                    summary_prompt,
-                    subagent_trajectory_refs,
-                ) = await self._summarize_with_retry(
-                    chat, original_instruction, session
-                )
-                # Store subagent_refs to include in the trajectory
-                self._pending_subagent_refs = subagent_trajectory_refs
-                # Store handoff prompt to add as a user step
-                self._pending_handoff_prompt = summary_prompt
-                self.logger.debug("SUMMARIZATION: Full summary succeeded")
-            except Exception as e:
-                self.logger.debug(f"SUMMARIZATION: Full summary failed: {e}")
-
-            # Fallback 2: Try short summary
-            if summary_prompt is None:
-                try:
-                    self.logger.debug("SUMMARIZATION: Attempting short summary")
-                    current_screen = await session.capture_pane(capture_entire=False)
-                    limited_screen = current_screen[-1000:] if current_screen else ""
-
-                    short_prompt = f"Briefly continue this task: {original_instruction}\n\nCurrent state: {limited_screen}\n\nNext steps (2-3 sentences):"
-
-                    # Reserve an explicit output budget so even this short
-                    # fallback summary cannot be silently truncated. Its input
-                    # is tiny (instruction + last 1000 chars), so no unwind is
-                    # needed — just the max_tokens reservation.
-                    short_call_kwargs = dict(self._llm_call_kwargs)
-                    short_call_kwargs["max_tokens"] = RESERVED_SUMMARY_OUTPUT
-                    short_llm_response: LLMResponse = await self._llm.call(
-                        prompt=short_prompt,
-                        **short_call_kwargs,
-                    )
-                    summary_prompt = f"{original_instruction}\n\nSummary: {short_llm_response.content}"
-                    self.logger.debug("SUMMARIZATION: Short summary succeeded")
-                except Exception as e:
-                    self.logger.error(f"SUMMARIZATION: Short summary failed: {e}")
-
-            # Fallback 3: Ultimate fallback (no LLM calls). This is genuine
-            # last-resort: it discards real summarization and hands the next
-            # agent only the instruction + last 1000 chars of screen, which
-            # materially depresses reward. Log LOUDLY (error) — reaching here
-            # means both LLM summary attempts failed despite reserved output
-            # budget, which should be rare and is worth surfacing.
-            if summary_prompt is None:
-                self.logger.error(
-                    "SUMMARIZATION: Using degenerate LLM-free ultimate fallback "
-                    "(both full and short summary failed despite reserved output "
-                    "budget); next agent gets only instruction + last 1000 chars."
-                )
-                current_screen = await session.capture_pane(capture_entire=False)
-                limited_screen = current_screen[-1000:] if current_screen else ""
-                summary_prompt = (
-                    f"{original_instruction}\n\nCurrent state: {limited_screen}"
-                )
-
-            if prompt_path is not None:
-                _enqueue_episode_text(prompt_path, summary_prompt)
-
-            try:
-                start_time = time.time()
-                llm_response = await chat.chat(
-                    summary_prompt,
-                    logging_path=logging_path,
-                    **self._llm_call_kwargs,
-                )
-                end_time = time.time()
-                request_time_ms = (end_time - start_time) * 1000
-                self._api_request_times.append(request_time_ms)
-
-            except Exception as e:
-                self.logger.error(f"Even fallback chat failed: {e}")
-                llm_response = LLMResponse(
-                    content="Technical difficulties. Please continue with the task."
-                )
-
-            if response_path is not None:
-                _enqueue_episode_text(response_path, llm_response.content)
-            return llm_response
+        except ContextLengthExceededError as error:
+            return await self._recover_context_capacity(
+                chat=chat,
+                error=error,
+                request_context=request_context,
+            )
 
         except OutputLengthExceededError as e:
-            self.logger.debug(f"Output length exceeded: {e}")
-
-            truncated_response = getattr(
-                e, "truncated_response", "[TRUNCATED RESPONSE NOT AVAILABLE]"
-            )
-
-            # Try to salvage a valid response from the truncated output
-            # Only available for XML parser
-            salvaged_response = None
-            has_multiple_blocks = False
-
-            if hasattr(self._parser, "salvage_truncated_response"):
-                salvaged_response, has_multiple_blocks = (
-                    self._parser.salvage_truncated_response(truncated_response)
-                )
-
-            if salvaged_response:
-                self.logger.debug(
-                    "Output exceeded length but found valid response. "
-                    "Using truncated version."
-                )
-
-                if response_path is not None:
-                    _enqueue_episode_text(response_path, salvaged_response)
-
-                return salvaged_response
-
-            # If we get here, we couldn't salvage a valid response
-            # Try to parse the truncated response to get warnings
-            warnings_text = ""
-            try:
-                parse_result = self._parser.parse_response(truncated_response)
-                if parse_result.warning:
-                    warnings_text = (
-                        f"\n\nParser warnings from your truncated response:\n"
-                        f"{parse_result.warning}"
-                    )
-            except Exception as parse_error:
-                self.logger.debug(f"Failed to parse truncated response: {parse_error}")
-
-            # Get the actual output limit for the model
-            output_limit = self._llm.get_model_output_limit()
-            if output_limit is not None:
-                limit_str = f"{output_limit} tokens"
-            else:
-                limit_str = "the maximum output length"
-
-            error_msg = (
-                "ERROR!! NONE of the actions you just requested were performed "
-                f"because you exceeded {limit_str}. "
-                f"Your outputs must be less than {limit_str}. Re-issue this request, "
-                f"breaking it into chunks each of which is less than {limit_str}."
-            )
-
-            if warnings_text:
-                error_msg += warnings_text
-
-            chat.messages.append({"role": "user", "content": prompt})
-            chat.messages.append({"role": "assistant", "content": truncated_response})
-            chat.reset_response_chain()
-
-            if response_path is not None:
-                _enqueue_episode_text(response_path, error_msg)
-
-            return await self._query_llm(
+            return await self._recover_output_overflow(
                 chat=chat,
-                prompt=error_msg,
-                logging_paths=logging_paths,
-                original_instruction=original_instruction,
-                session=session,
+                prompt=prompt,
+                error=e,
+                request_context=request_context,
             )
 
-        except Exception as e:
-            self.logger.error(f"Unknown Error in LLM interaction: {e}")
-            raise e
+    async def _dispatch_llm_request(
+        self,
+        chat: Chat,
+        prompt: str,
+        logging_path: Path | UPath | None,
+        response_path: Path | UPath | None,
+    ) -> LLMResponse:
+        start_time = time.time()
+        response = await chat.chat(
+            prompt,
+            logging_path=logging_path,
+            **self._llm_call_kwargs,
+        )
+        self._track_api_request_time(start_time)
+        if response_path is not None:
+            _enqueue_episode_text(response_path, response.content)
+        return response
+
+    async def _recover_context_capacity(
+        self,
+        *,
+        chat: Chat,
+        error: ContextLengthExceededError,
+        request_context: LLMRequestContext,
+    ) -> LLMResponse:
+        if not self._enable_summarize:
+            self.logger.debug("Context capacity exceeded and summarization is OFF.")
+            raise error
+        if request_context.session is None:
+            raise RuntimeError("Cannot handle context length error without session")
+
+        self.logger.debug("Context capacity exceeded. Recovering context.")
+        summary_prompt, subagent_refs = await self._summarize_with_retry(
+            chat, request_context.original_instruction, request_context.session
+        )
+        self._pending_subagent_refs = subagent_refs
+        self._pending_handoff_prompt = summary_prompt
+        if request_context.logging_paths.prompt is not None:
+            _enqueue_episode_text(request_context.logging_paths.prompt, summary_prompt)
+
+        try:
+            return await self._dispatch_llm_request(
+                chat,
+                summary_prompt,
+                request_context.logging_paths.debug,
+                request_context.logging_paths.response,
+            )
+        except ContextLengthExceededError as error:
+            raise ContextManagementInfrastructureError(
+                "The recovered conversation still did not leave enough room "
+                "for the handoff request."
+            ) from error
+
+    async def _recover_output_overflow(
+        self,
+        *,
+        chat: Chat,
+        prompt: str,
+        error: OutputLengthExceededError,
+        request_context: LLMRequestContext,
+    ) -> LLMResponse:
+        self.logger.debug(f"Output length exceeded: {error}")
+        truncated_response = (
+            error.truncated_response or "[TRUNCATED RESPONSE NOT AVAILABLE]"
+        )
+        response_path = request_context.logging_paths.response
+
+        salvaged_response = self._parser.salvage_truncated_response(truncated_response)
+        if salvaged_response:
+            self.logger.debug(
+                "Output exceeded length but found valid response. "
+                "Using truncated version."
+            )
+            if response_path is not None:
+                _enqueue_episode_text(response_path, salvaged_response)
+            return salvaged_response
+
+        warnings_text = ""
+        parse_result = self._parser.parse_response(truncated_response)
+        if parse_result.warning:
+            warnings_text = (
+                f"\n\nParser warnings from your truncated response:\n"
+                f"{parse_result.warning}"
+            )
+
+        output_limit = self._llm.get_model_output_limit()
+        limit_str = (
+            f"{output_limit} tokens"
+            if output_limit is not None
+            else "the maximum output length"
+        )
+        error_msg = (
+            "ERROR!! NONE of the actions you just requested were performed "
+            f"because you exceeded {limit_str}. "
+            f"Your outputs must be less than {limit_str}. Re-issue this request, "
+            f"breaking it into chunks each of which is less than {limit_str}."
+            f"{warnings_text}"
+        )
+        chat.messages.append({"role": "user", "content": prompt})
+        chat.messages.append({"role": "assistant", "content": truncated_response})
+        chat.reset_response_chain()
+        if response_path is not None:
+            _enqueue_episode_text(response_path, error_msg)
+
+        return await self._query_llm(
+            chat=chat,
+            prompt=error_msg,
+            request_context=request_context,
+        )
 
     async def _handle_llm_interaction(
         self,
         chat: Chat,
         prompt: str,
-        logging_paths: tuple[
-            Path | UPath | None, Path | UPath | None, Path | UPath | None
-        ],
+        logging_paths: EpisodeLoggingPaths,
         original_instruction: str = "",
         session: TmuxSession | None = None,
-    ) -> tuple[list[Command], bool, str, str, str, LLMResponse]:
-        llm_response = await self._query_llm(
-            chat, prompt, logging_paths, original_instruction, session
+    ) -> LLMInteractionResult:
+        request_context = LLMRequestContext(
+            logging_paths=logging_paths,
+            original_instruction=original_instruction,
+            session=session,
         )
+        llm_response = await self._query_llm(chat, prompt, request_context)
 
         result = self._parser.parse_response(llm_response.content)
 
@@ -1786,13 +1797,13 @@ so ask everything you need to know."""
                 )
             )
 
-        return (
-            commands,
-            result.is_task_complete,
-            feedback,
-            result.analysis,
-            result.plan,
-            llm_response,
+        return LLMInteractionResult(
+            commands=commands,
+            is_task_complete=result.is_task_complete,
+            feedback=feedback,
+            analysis=result.analysis,
+            plan=result.plan,
+            response=llm_response,
         )
 
     async def _execute_commands(
@@ -1865,6 +1876,7 @@ so ask everything you need to know."""
                     chat,
                     original_instruction,
                     self._session,
+                    pending_prompt=prompt,
                 )
                 if proactive_summary_result:
                     prompt, subagent_refs = proactive_summary_result
@@ -1881,16 +1893,15 @@ so ask everything you need to know."""
             tokens_before_cache = chat.total_cache_tokens
             cost_before = chat.total_cost
 
-            (
-                commands,
-                is_task_complete,
-                feedback,
-                analysis,
-                plan,
-                llm_response,
-            ) = await self._handle_llm_interaction(
+            interaction = await self._handle_llm_interaction(
                 chat, prompt, logging_paths, original_instruction, self._session
             )
+            commands = interaction.commands
+            is_task_complete = interaction.is_task_complete
+            feedback = interaction.feedback
+            analysis = interaction.analysis
+            plan = interaction.plan
+            llm_response = interaction.response
 
             # If we have pending subagent refs, add a system step to record the delegation
             # This must happen before we build the agent step
