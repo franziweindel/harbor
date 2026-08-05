@@ -52,6 +52,24 @@ class ResourceMode(str, Enum):
     IGNORE = "ignore"
 
 
+class ResolvedStepTimeouts(BaseModel):
+    """Effective agent and verifier deadlines for one task step."""
+
+    name: str
+    agent: float | None
+    verifier: float | None
+
+
+class ResolvedTimeouts(BaseModel):
+    """Effective phase deadlines persisted with a trial configuration."""
+
+    agent: float | None
+    verifier: float
+    agent_setup: float
+    environment_build: float
+    steps: list[ResolvedStepTimeouts] = Field(default_factory=list)
+
+
 class AgentConfig(BaseModel):
     name: str | None = None
     import_path: str | None = None
@@ -60,7 +78,13 @@ class AgentConfig(BaseModel):
     mode: Literal["container", "local"] = "container"
     override_timeout_sec: float | None = None
     override_setup_timeout_sec: float | None = None
-    max_timeout_sec: float | None = None
+    max_timeout_sec: float | None = Field(
+        default=None,
+        description=(
+            "Hard ceiling on the final agent timeout after applying the effective "
+            "timeout multiplier."
+        ),
+    )
     kwargs: dict[str, Any] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
@@ -228,7 +252,13 @@ class EnvironmentConfig(BaseModel):
 
 class VerifierConfig(BaseModel):
     override_timeout_sec: float | None = None
-    max_timeout_sec: float | None = None
+    max_timeout_sec: float | None = Field(
+        default=None,
+        description=(
+            "Hard ceiling on the final verifier timeout after applying the "
+            "effective timeout multiplier."
+        ),
+    )
     env: dict[str, str] = Field(default_factory=dict)
     import_path: str | None = Field(default=None, exclude_if=lambda v: v is None)
     kwargs: dict[str, Any] = Field(default_factory=dict, exclude_if=lambda v: not v)
@@ -305,6 +335,10 @@ class TrialConfig(BaseModel):
     # harbor.models.job.lock so lock.json records the same resolved run input.
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    EQUALITY_EXCLUDED_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"trial_name", "job_id", "resolved_timeouts"}
+    )
+
     task: TaskConfig
     trial_name: str = ""
     trials_dir: UPath = Field(default_factory=lambda: UPath("trials"))
@@ -313,6 +347,7 @@ class TrialConfig(BaseModel):
     verifier_timeout_multiplier: float | None = None
     agent_setup_timeout_multiplier: float | None = None
     environment_build_timeout_multiplier: float | None = None
+    resolved_timeouts: ResolvedTimeouts | None = None
     agent: AgentConfig = Field(default_factory=AgentConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
@@ -350,9 +385,9 @@ class TrialConfig(BaseModel):
         if not isinstance(other, TrialConfig):
             return NotImplemented
 
-        # Exclude identity fields from equality comparison.
-        exclude = {"trial_name", "job_id"}
-        return self.model_dump(exclude=exclude) == other.model_dump(exclude=exclude)
+        return self.model_dump(exclude=self.EQUALITY_EXCLUDED_FIELDS) == (
+            other.model_dump(exclude=self.EQUALITY_EXCLUDED_FIELDS)
+        )
 
     # Agent-config keys that describe HOW a trial is SERVED at runtime (which
     # served-model alias / endpoint / sampling-transport knobs the agent dials)
@@ -369,8 +404,8 @@ class TrialConfig(BaseModel):
         "override_setup_timeout_sec",
         "max_timeout_sec",
     }
-    # Top-level TrialConfig fields that are purely runtime-serving (timeout
-    # scaling / artifact wiring) and likewise do not change a trial's identity.
+    # Top-level TrialConfig fields that record runtime serving, artifact wiring,
+    # or derived execution metadata and do not change a trial's identity.
     _SERVING_TOP_FIELDS: ClassVar[set[str]] = {
         "trial_name",
         "job_id",
@@ -380,6 +415,7 @@ class TrialConfig(BaseModel):
         "verifier_timeout_multiplier",
         "agent_setup_timeout_multiplier",
         "environment_build_timeout_multiplier",
+        "resolved_timeouts",
         "artifacts",
     }
     # Environment ``kwargs`` keys that are cache-acquisition / provisioning

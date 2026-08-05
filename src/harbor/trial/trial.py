@@ -18,7 +18,12 @@ from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import (
     resolve_effective_verifier_env_config,
 )
-from harbor.models.trial.config import ArtifactConfig, ServiceVolumeConfig, TrialConfig
+from harbor.models.trial.config import (
+    ArtifactConfig,
+    ResolvedTimeouts,
+    ServiceVolumeConfig,
+    TrialConfig,
+)
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.models.trial.result import (
     ExceptionInfo,
@@ -365,7 +370,10 @@ class Trial(ABC):
         resolved_multiplier = (
             multiplier if multiplier is not None else self.config.timeout_multiplier
         )
-        return min(base_sec, max_sec or float("inf")) * resolved_multiplier
+        resolved_sec = base_sec * resolved_multiplier
+        if max_sec is None:
+            return resolved_sec
+        return min(resolved_sec, max_sec)
 
     async def _run_agent_phase(
         self,
@@ -646,7 +654,10 @@ class Trial(ABC):
         # the artifact writer so it neither blocks the shared event loop nor
         # occupies a default-executor slot. Awaited: a trial must not start
         # without its config durably recorded.
-        config_json = self.config.model_dump_json(indent=4)
+        persisted_config = self.config.model_copy(
+            update={"resolved_timeouts": self._resolved_timeouts()}
+        )
+        config_json = persisted_config.model_dump_json(indent=4)
         await asyncio.wrap_future(
             get_artifact_writer().submit(
                 self.paths.config_path,
@@ -746,6 +757,14 @@ class Trial(ABC):
         self._agent_setup_timeout_sec = self._compute_agent_setup_timeout_sec()
         self._environment_build_timeout_sec = (
             self._compute_environment_build_timeout_sec()
+        )
+
+    def _resolved_timeouts(self) -> ResolvedTimeouts:
+        return ResolvedTimeouts(
+            agent=self._agent_timeout_sec,
+            verifier=self._verifier_timeout_sec,
+            agent_setup=self._agent_setup_timeout_sec,
+            environment_build=self._environment_build_timeout_sec,
         )
 
     def _compute_agent_timeout_sec(self) -> float | None:
