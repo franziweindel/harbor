@@ -36,6 +36,11 @@ from harbor.models.job.lock import (
     JobLock,
     build_job_lock,
 )
+from harbor.models.job.reconciliation import (
+    TrialPlanMismatchError,
+    classify_trial_plan_mismatches,
+    trial_identity_key,
+)
 from harbor.models.job.result import EvalsRewardsMap, JobResult, JobStats
 from harbor.models.trial.config import TaskConfig, TrialConfig
 from harbor.models.trial.paths import TrialPaths
@@ -425,14 +430,13 @@ class Job:
                 default=str,
             )
 
-        def _identity_key(cfg: TrialConfig) -> str:
-            return json.dumps(cfg.identity_fingerprint(), sort_keys=True, default=str)
-
         existing_by_exact: dict[str, deque[int]] = defaultdict(deque)
         existing_by_identity: dict[str, deque[int]] = defaultdict(deque)
         for index, existing_trial_config in enumerate(self._existing_trial_configs):
             existing_by_exact[_exact_key(existing_trial_config)].append(index)
-            existing_by_identity[_identity_key(existing_trial_config)].append(index)
+            existing_by_identity[trial_identity_key(existing_trial_config)].append(
+                index
+            )
 
         def _take(bucket: deque[int] | None) -> int | None:
             """Pop the lowest-index still-unmatched existing trial from *bucket*.
@@ -466,7 +470,7 @@ class Job:
                 continue
 
             existing_index = _take(
-                existing_by_identity.get(_identity_key(trial_config))
+                existing_by_identity.get(trial_identity_key(trial_config))
             )
             if existing_index is None:
                 remaining_trial_configs.append(trial_config)
@@ -489,14 +493,9 @@ class Job:
                 for i in range(len(self._existing_trial_configs))
                 if i not in matched_existing_indices
             ]
-            raise ValueError(
-                "Existing trial config does not match planned job config: "
-                f"{len(unmatched)} on-disk trial(s) have no counterpart in the "
-                "planned job even after ignoring runtime-serving drift. This "
-                "indicates a SEMANTIC mismatch (model / benchmark / task / "
-                "n_attempts / dataset differs) — the resume target is a "
-                "different evaluation, so the existing trials cannot be reused. "
-                f"First unmatched trial: {unmatched[0].trial_name!r}."
+            raise TrialPlanMismatchError(
+                classify_trial_plan_mismatches(unmatched, self._trial_configs),
+                compatible_existing_count=len(matched_existing_indices),
             )
 
         if serving_drift_count:
