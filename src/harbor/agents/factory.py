@@ -79,6 +79,7 @@ class AgentFactory:
         name: AgentName,
         logs_dir: Path | UPath,
         model_name: str | None = None,
+        model_alias: str | None = None,
         **kwargs,
     ) -> BaseAgent:
         """
@@ -101,7 +102,12 @@ class AgentFactory:
 
         agent_class = cls._AGENT_MAP[name]
 
-        return agent_class(logs_dir=logs_dir, model_name=model_name, **kwargs)
+        return agent_class(
+            logs_dir=logs_dir,
+            model_name=model_name,
+            model_alias=model_alias,
+            **kwargs,
+        )
 
     @classmethod
     def create_agent_from_import_path(
@@ -109,6 +115,7 @@ class AgentFactory:
         import_path: str,
         logs_dir: Path | UPath,
         model_name: str | None = None,
+        model_alias: str | None = None,
         **kwargs,
     ) -> BaseAgent:
         """
@@ -141,7 +148,12 @@ class AgentFactory:
                 f"Module '{module_path}' has no class '{class_name}'"
             ) from e
 
-        return Agent(logs_dir=logs_dir, model_name=model_name, **kwargs)
+        return Agent(
+            logs_dir=logs_dir,
+            model_name=model_name,
+            model_alias=model_alias,
+            **kwargs,
+        )
 
     @classmethod
     def create_agent_from_config(
@@ -163,7 +175,6 @@ class AgentFactory:
             ValueError: If the configuration is invalid.
         """
         extra_env = resolve_env_vars(config.env)
-
         # Local mode: route to local agent adapter
         if config.mode == "local":
             if config.name is not None and config.name in AgentName.values():
@@ -178,6 +189,7 @@ class AgentFactory:
                 return agent_class(
                     logs_dir=logs_dir,
                     model_name=config.model_name,
+                    model_alias=config.model_alias,
                     extra_env=extra_env,
                     **config.kwargs,
                     **kwargs,
@@ -199,6 +211,7 @@ class AgentFactory:
                 name,
                 logs_dir=logs_dir,
                 model_name=config.model_name,
+                model_alias=config.model_alias,
                 extra_env=extra_env,
                 **agent_kwargs,
             )
@@ -207,6 +220,7 @@ class AgentFactory:
                 config.import_path,
                 logs_dir=logs_dir,
                 model_name=config.model_name,
+                model_alias=config.model_alias,
                 extra_env=extra_env,
                 **config.kwargs,
                 **kwargs,

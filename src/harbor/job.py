@@ -41,7 +41,12 @@ from harbor.models.job.reconciliation import (
     classify_trial_plan_mismatches,
     trial_identity_key,
 )
-from harbor.models.job.result import EvalsRewardsMap, JobResult, JobStats
+from harbor.models.job.result import (
+    ADHOC_DATASET_NAME,
+    EvalsRewardsMap,
+    JobResult,
+    JobStats,
+)
 from harbor.models.trial.config import TaskConfig, TrialConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
@@ -284,7 +289,7 @@ class Job:
         # `_init_remaining_trial_configs`, which matches each on-disk trial to a
         # planned trial by *identity* (task / benchmark / dataset / agent
         # program / environment build / verifier), tolerates benign runtime
-        # drift (served-model alias, api_base rewritten to the live node,
+        # drift (model_alias, api_base rewritten to the live node,
         # timeout multipliers), and still raises on a genuine SEMANTIC mismatch.
         # A crude exact-equality `FileExistsError` here fired BEFORE that check
         # ran, so every preempt-resume — and the end-of-job
@@ -324,16 +329,7 @@ class Job:
         )
 
         for trial_result in self._existing_trial_results:
-            agent_name = trial_result.agent_info.name
-            model_name = (
-                trial_result.agent_info.model_info.name
-                if trial_result.agent_info.model_info
-                else None
-            )
-            dataset_name = trial_result.source or "adhoc"
-            evals_key = JobStats.format_agent_evals_key(
-                agent_name, model_name, dataset_name
-            )
+            evals_key = JobStats.evals_key_for(trial_result)
             self._existing_rewards[evals_key][trial_result.trial_name] = (
                 trial_result.verifier_result.rewards
                 if trial_result.verifier_result is not None
@@ -400,7 +396,7 @@ class Job:
         2. **Identity-only** (:meth:`TrialConfig.matches_identity`) — same
            evaluation (task / benchmark / dataset / agent program / environment
            build / verifier) but the runtime *serving* config has drifted
-           (e.g. a ``--served-model-name`` alias, an ``api_base`` rewritten to
+           (e.g. a serving alias, an ``api_base`` rewritten to
            the live node, ``--enforce-eager``/timeout-multiplier changes). Such
            drift does NOT change what a trial *is*, so the existing trial is
            kept and the drift is logged loudly — instead of aborting the whole
@@ -501,7 +497,7 @@ class Job:
         if serving_drift_count:
             logger.warning(
                 "Resume reconciliation: kept %d existing trial(s) across benign "
-                "runtime-serving drift (served-model alias / api_base / timeout "
+                "runtime-serving drift (model_alias / api_base / timeout "
                 "scaling). Task identity is unchanged; partial progress preserved.",
                 serving_drift_count,
             )
@@ -515,10 +511,10 @@ class Job:
         existing_agent = existing.agent
         planned_agent = planned.agent
         diffs: list[str] = []
-        if existing_agent.model_name != planned_agent.model_name:
+        if existing_agent.model_alias != planned_agent.model_alias:
             diffs.append(
-                f"agent.model_name {existing_agent.model_name!r} -> "
-                f"{planned_agent.model_name!r}"
+                f"agent.model_alias {existing_agent.model_alias!r} -> "
+                f"{planned_agent.model_alias!r}"
             )
         if existing_agent.kwargs.get("api_base") != planned_agent.kwargs.get(
             "api_base"
@@ -658,17 +654,8 @@ class Job:
 
     @staticmethod
     def _evals_key_for_result(trial_result: TrialResult) -> tuple[str, str]:
-        agent_name = trial_result.agent_info.name
-        model_name = (
-            trial_result.agent_info.model_info.name
-            if trial_result.agent_info.model_info
-            else None
-        )
-        dataset_name = trial_result.source or "adhoc"
-        return (
-            JobStats.format_agent_evals_key(agent_name, model_name, dataset_name),
-            dataset_name,
-        )
+        dataset_name = trial_result.source or ADHOC_DATASET_NAME
+        return JobStats.evals_key_for(trial_result), dataset_name
 
     def _refresh_metrics_for_eval(self, evals_key: str, dataset_name: str) -> None:
         rewards_list = list(self._live_rewards[evals_key].values())
@@ -721,7 +708,7 @@ class Job:
             for metric in config.metrics
         ]
 
-        metrics["adhoc"].extend(job_metrics)
+        metrics[ADHOC_DATASET_NAME].extend(job_metrics)
 
         for dataset_config in config.datasets:
             await Job._resolve_dataset_metrics(dataset_config, metrics, job_metrics)
@@ -1049,16 +1036,7 @@ class Job:
             final_rewards = defaultdict(list)
 
             for trial_result in combined_trial_results:
-                agent_name = trial_result.agent_info.name
-                model_name = (
-                    trial_result.agent_info.model_info.name
-                    if trial_result.agent_info.model_info
-                    else None
-                )
-                dataset_name = trial_result.source or "adhoc"
-                evals_key = JobStats.format_agent_evals_key(
-                    agent_name, model_name, dataset_name
-                )
+                evals_key = JobStats.evals_key_for(trial_result)
 
                 if trial_result.verifier_result is not None:
                     final_rewards[evals_key].append(
@@ -1247,19 +1225,13 @@ class Job:
         """Update the progress bar description with the latest metric value."""
         if not self._metrics or event.result is None:
             return
-        dataset_name = event.config.task.source or "adhoc"
+        dataset_name = event.config.task.source or ADHOC_DATASET_NAME
         if dataset_name not in self._metrics:
             return
 
         rewards = list(
             self._live_rewards.get(
-                JobStats.format_agent_evals_key(
-                    event.result.agent_info.name,
-                    event.result.agent_info.model_info.name
-                    if event.result.agent_info.model_info
-                    else None,
-                    dataset_name,
-                ),
+                JobStats.evals_key_for(event.result),
                 {},
             ).values()
         )

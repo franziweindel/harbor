@@ -103,11 +103,11 @@ class Aider(BaseInstalledAgent):
     ) -> None:
         escaped_instruction = shlex.quote(instruction)
 
-        # Determine provider and API key from model name
-        if not self.model_name or "/" not in self.model_name:
+        # Determine provider and API key from the serving alias.
+        if not self.model_alias or "/" not in self.model_alias:
             raise ValueError("Model name must be in the format provider/model_name")
 
-        provider, model = self.model_name.split("/", 1)
+        provider, model = self.model_alias.split("/", 1)
 
         # Get API key based on provider
         if provider == "openai":

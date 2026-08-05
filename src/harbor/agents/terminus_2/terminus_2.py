@@ -499,16 +499,18 @@ class Terminus2(BaseAgent):
         if model_name is None:
             raise ValueError("model_name is required for Terminus 2")
 
-        self._model_name = model_name
+        if self.model_alias is None:
+            raise ValueError("model_alias could not be resolved for Terminus 2")
+
         self._last_response_model_name: str | None = None
         self._parser_name = parser_name
         self._collect_rollout_details = collect_rollout_details
         self._reasoning_effort = reasoning_effort
-        resolved_model_info = self._resolve_model_info(model_name, model_info)
+        resolved_model_info = self._resolve_model_info(self.model_alias, model_info)
 
         self._llm = self._init_llm(
             llm_backend=llm_backend,
-            model_name=model_name,
+            model_name=self.model_alias,
             temperature=temperature,
             collect_rollout_details=collect_rollout_details,
             llm_kwargs=llm_kwargs,
@@ -888,7 +890,7 @@ class Terminus2(BaseAgent):
         api_base = getattr(self._llm, "_api_base", None)
         if not api_base:
             return None
-        model_for_request = self._model_name
+        model_for_request = self.model_alias
         for prefix in ("hosted_vllm/", "openai/"):
             if model_for_request.startswith(prefix):
                 model_for_request = model_for_request[len(prefix) :]
@@ -922,7 +924,7 @@ class Terminus2(BaseAgent):
         messages = list(chat.messages)
         if extra_messages:
             messages.extend(extra_messages)
-        return token_counter(model=self._model_name, messages=messages)
+        return token_counter(model=self.model_alias, messages=messages)
 
     async def _acount_total_tokens(
         self,
@@ -1472,7 +1474,7 @@ so ask everything you need to know."""
                 step_id=step_id_counter,
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 source="agent",
-                model_name=summary_response.model_name or self._model_name,
+                model_name=summary_response.model_name or self.model_alias,
                 message=summary_response.content,
                 reasoning_content=summary_response.reasoning_content,
                 is_copied_context=True,
@@ -1986,7 +1988,7 @@ so ask everything you need to know."""
                         step_id=len(self._trajectory_steps) + 1,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         source="agent",
-                        model_name=llm_response.model_name or self._model_name,
+                        model_name=llm_response.model_name or self.model_alias,
                         message=llm_response.content,
                         reasoning_content=llm_response.reasoning_content,
                         observation=Observation(
@@ -2119,7 +2121,7 @@ so ask everything you need to know."""
                     step_id=len(self._trajectory_steps) + 1,
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     source="agent",
-                    model_name=llm_response.model_name or self._model_name,
+                    model_name=llm_response.model_name or self.model_alias,
                     message=message_content,
                     reasoning_content=llm_response.reasoning_content,
                     tool_calls=tool_calls,
@@ -2401,7 +2403,7 @@ so ask everything you need to know."""
                     step_id=step_id,
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     source="agent",
-                    model_name=response.model_name or self._model_name,
+                    model_name=response.model_name or self.model_alias,
                     message=response.content,
                     reasoning_content=response.reasoning_content,
                     metrics=Metrics(
@@ -2424,7 +2426,7 @@ so ask everything you need to know."""
                     step_id=step_id,
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     source="agent",
-                    model_name=response.model_name or self._model_name,
+                    model_name=response.model_name or self.model_alias,
                     message=response.content,
                     reasoning_content=response.reasoning_content,
                 )
@@ -2461,7 +2463,7 @@ so ask everything you need to know."""
             agent=Agent(
                 name=agent_name,
                 version=self.version() or "unknown",
-                model_name=self._model_name,
+                model_name=self.model_alias,
                 extra={
                     "parent_session_id": self._session_id,
                     "summarization_index": self._summarization_count,
@@ -2525,7 +2527,7 @@ so ask everything you need to know."""
                     step_id=step_id,
                     source=source,
                     message=content,
-                    model_name=self._last_response_model_name or self._model_name,
+                    model_name=self._last_response_model_name or self.model_alias,
                 )
             else:
                 source = role
@@ -2643,7 +2645,7 @@ so ask everything you need to know."""
             agent=Agent(
                 name=self.name(),
                 version=self.version() or "unknown",
-                model_name=self._model_name,
+                model_name=self.model_alias,
                 extra=agent_extra,
             ),
             steps=list(self._trajectory_steps),

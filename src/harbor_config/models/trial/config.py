@@ -16,6 +16,7 @@ from shortuuid import ShortUUID
 from upath import UPath
 
 from harbor_config.env import templatize_sensitive_env
+from harbor_config.model_name import split_provider_model_name
 from harbor_config.models.agent.name import AgentName
 from harbor_config.models.environment_type import EnvironmentType
 from harbor_config.models.task.config import ArtifactConfig, MCPServerConfig, TpuSpec
@@ -73,7 +74,14 @@ class ResolvedTimeouts(BaseModel):
 class AgentConfig(BaseModel):
     name: str | None = None
     import_path: str | None = None
-    model_name: str | None = None
+    model_name: str | None = Field(
+        default=None,
+        description="Immutable model identity recorded in results and used for resume.",
+    )
+    model_alias: str | None = Field(
+        default=None,
+        description="Mutable serving name used to route model requests for this run.",
+    )
     skills: list[Path] = Field(default_factory=list)
     mode: Literal["container", "local"] = "container"
     override_timeout_sec: float | None = None
@@ -103,6 +111,20 @@ class AgentConfig(BaseModel):
     @classmethod
     def _serialize_env(cls, env: dict[str, str]) -> dict[str, str]:
         return templatize_sensitive_env(env)
+
+    @model_validator(mode="after")
+    def require_model_name_for_alias(self):
+        if self.model_alias is not None and self.model_name is None:
+            raise ValueError("model_alias requires an immutable model_name")
+        return self
+
+    @property
+    def model_name_without_provider(self) -> str | None:
+        """Return the immutable model name with its provider prefix removed."""
+        if self.model_name is None:
+            return None
+        _, model_name = split_provider_model_name(self.model_name)
+        return model_name
 
     @field_serializer("kwargs")
     @classmethod
@@ -397,7 +419,7 @@ class TrialConfig(BaseModel):
     # task, the prompt, the verifier, or the trial's identity. The resume
     # reconciliation must ignore these so partial progress survives benign drift.
     _SERVING_AGENT_FIELDS: ClassVar[set[str]] = {
-        "model_name",
+        "model_alias",
         "kwargs",
         "env",
         "override_timeout_sec",

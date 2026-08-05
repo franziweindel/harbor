@@ -4,6 +4,8 @@ from pathlib import Path
 
 from upath import UPath
 
+from harbor_config.model_name import split_provider_model_name
+
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import MCPServerConfig
@@ -19,6 +21,7 @@ class BaseAgent(ABC):
     # redirects writes (e.g. trajectory.json) to the local filesystem.
     logs_dir: Path | UPath
     model_name: str | None
+    model_alias: str | None
     logger: logging.Logger
 
     # Whether agent supports Harbor's trajectory format (ATIF)
@@ -44,6 +47,7 @@ class BaseAgent(ABC):
         self,
         logs_dir: Path | UPath,
         model_name: str | None = None,
+        model_alias: str | None = None,
         logger: logging.Logger | None = None,
         mcp_servers: list[MCPServerConfig]
         | None = None,  # MCP servers from task config; see setup()/run() for usage
@@ -53,6 +57,7 @@ class BaseAgent(ABC):
     ):
         self.logs_dir = logs_dir
         self.model_name = model_name
+        self.model_alias = model_name if model_alias is None else model_alias
         self.logger = (logger or global_logger).getChild(__name__)
         self.mcp_servers = mcp_servers or []
         self.skills_dir = skills_dir
@@ -60,19 +65,15 @@ class BaseAgent(ABC):
         self._init_model_info()
 
     def _init_model_info(self):
-        self._parsed_model_provider = None
-        self._parsed_model_name = None
+        self._model_identity_provider = None
+        self._model_identity_name = None
 
         if self.model_name is None:
             return
 
-        if "/" in self.model_name:
-            self._parsed_model_provider, self._parsed_model_name = (
-                self.model_name.split("/", maxsplit=1)
-            )
-            return
-
-        self._parsed_model_name = self.model_name
+        self._model_identity_provider, self._model_identity_name = (
+            split_provider_model_name(self.model_name)
+        )
 
     def to_agent_info(self) -> AgentInfo:
         return AgentInfo(
@@ -80,10 +81,10 @@ class BaseAgent(ABC):
             version=self.version() or "unknown",
             model_info=(
                 ModelInfo(
-                    name=self._parsed_model_name,
-                    provider=self._parsed_model_provider,
+                    name=self._model_identity_name,
+                    provider=self._model_identity_provider,
                 )
-                if self._parsed_model_name
+                if self._model_identity_name
                 else None
             ),
         )
