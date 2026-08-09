@@ -1,6 +1,10 @@
 import hashlib
 import json
+import runpy
 from copy import deepcopy
+from dataclasses import asdict
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -19,11 +23,7 @@ from harbor_config import (
     resolver_fingerprint,
     schema_fingerprint,
 )
-from harbor_config.release import (
-    release_manifest,
-    release_needed,
-    release_needed_from_path,
-)
+from harbor_config.release import release_manifest
 from harbor_config.models.metric.config import MetricConfig
 from harbor_config.models.task.config import TaskConfig
 from harbor_config.models.trial.config import TrialConfig
@@ -150,7 +150,7 @@ def test_release_manifest_records_wheel_digest_and_schema(tmp_path) -> None:
         "harbor-config-abc123",
     )
 
-    assert manifest == {
+    assert asdict(manifest) == {
         "artifact": wheel_path.name,
         "package": "harbor-config",
         "package_version": "0.1.0",
@@ -161,23 +161,20 @@ def test_release_manifest_records_wheel_digest_and_schema(tmp_path) -> None:
         "schema_fingerprint": schema_fingerprint(),
         "sha256": hashlib.sha256(b"config-wheel").hexdigest(),
         "wheel_url": "https://github.com/marin-community/harbor/releases/download/harbor-config-abc123/harbor_config-0.1.0-py3-none-any.whl",
+        "pyproject_dependency": "harbor-config @ https://github.com/marin-community/harbor/releases/download/harbor-config-abc123/harbor_config-0.1.0-py3-none-any.whl",
     }
-    assert json.dumps(manifest)
 
 
-def test_release_decision_only_publishes_when_resolver_changes() -> None:
-    assert release_needed(None)
-    assert not release_needed({"resolver_fingerprint": resolver_fingerprint()})
-    assert release_needed({"resolver_fingerprint": "stale"})
+def test_standalone_wheel_build_ignores_wall_clock(tmp_path) -> None:
+    backend = runpy.run_path(str(Path("packages/harbor-config/build_backend.py")))
+    first_dist = tmp_path / "first"
+    second_dist = tmp_path / "second"
+    first_dist.mkdir()
+    second_dist.mkdir()
 
+    with patch("time.localtime", return_value=(2020, 1, 1, 0, 0, 0, 0, 1, -1)):
+        first_wheel = first_dist / backend["build_wheel"](str(first_dist))
+    with patch("time.localtime", return_value=(2026, 8, 9, 0, 0, 0, 0, 1, -1)):
+        second_wheel = second_dist / backend["build_wheel"](str(second_dist))
 
-def test_release_decision_reads_the_downloaded_manifest(tmp_path) -> None:
-    manifest_path = tmp_path / "harbor-config-manifest.json"
-    manifest_path.write_text(
-        json.dumps({"resolver_fingerprint": resolver_fingerprint()})
-    )
-
-    assert not release_needed_from_path(manifest_path)
-
-    manifest_path.write_text(json.dumps({"resolver_fingerprint": "stale"}))
-    assert release_needed_from_path(manifest_path)
+    assert first_wheel.read_bytes() == second_wheel.read_bytes()
