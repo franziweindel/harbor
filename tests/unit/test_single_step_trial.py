@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from harbor.agents.base import TurnCapExhaustedError
 from harbor.agents.installed.base import NonZeroAgentExitCodeError
 from harbor.llms.base import ContextBudgetExceededError, ContextLengthExceededError
 from harbor.models.trial.paths import EnvironmentPaths
@@ -85,6 +86,7 @@ def _agent_phase_trial(raised: Exception) -> SingleStepTrial:
         ContextLengthExceededError("served window exceeded"),
         NonZeroAgentExitCodeError("exit 1"),
         AgentTimeoutError("timed out"),
+        TurnCapExhaustedError("hit the max_turns cap"),
     ],
 )
 @pytest.mark.asyncio
