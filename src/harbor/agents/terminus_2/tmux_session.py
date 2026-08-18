@@ -755,6 +755,52 @@ class TmuxSession:
                 f"Failed to start tmux session. Error: {start_session_result.stderr or 'unknown error'}"
             )
 
+        # LOCAL PATCH: wait until the shell inside the new pane is actually
+        # READY before anyone types at it. On slow container starts (e.g.
+        # Apptainer instances pinned to 1 CPU on HPC), `bash --login` can take
+        # seconds to come up; keystrokes sent before that sit as raw text in
+        # the pty, the pane shows no prompt, and the agent's first terminal
+        # view is ungrounded garbage. Prove readiness end-to-end by sending an
+        # echo sentinel and waiting for its OUTPUT line (not the echoed
+        # command) to appear, then clear the screen so the sentinel never
+        # reaches the agent's context.
+        _sentinel = "HARBOR_SHELL_READY"
+        await self.environment.exec(
+            command=(
+                f"timeout 15 {tmux} -S {self._socket_path} send-keys "
+                f"-t {self._session_name} 'echo {_sentinel}_$((40+2))' Enter"
+            )
+        )
+        _shell_ready = False
+        for _ in range(30):
+            cap = await self.environment.exec(
+                command=(
+                    f"timeout 15 {tmux} -S {self._socket_path} capture-pane -p "
+                    f"-t {self._session_name}"
+                )
+            )
+            # `HARBOR_SHELL_READY_42` on its own line proves bash executed the
+            # sentinel (the typed command line contains `$((40+2))` instead).
+            if any(line.strip() == f"{_sentinel}_42"
+                   for line in (cap.stdout or "").splitlines()):
+                _shell_ready = True
+                break
+            await asyncio.sleep(1.0)
+        if _shell_ready:
+            await self.environment.exec(
+                command=(
+                    f"timeout 15 {tmux} -S {self._socket_path} send-keys "
+                    f"-t {self._session_name} 'clear' Enter"
+                )
+            )
+            await asyncio.sleep(0.5)
+        else:
+            self._logger.warning(
+                "Shell in tmux session %s did not become ready within 30s; "
+                "proceeding anyway (agent may see an ungrounded screen).",
+                self._session_name,
+            )
+
         if self._remote_asciinema_recording_path:
             self._logger.debug("Starting recording.")
             await self.send_keys(
