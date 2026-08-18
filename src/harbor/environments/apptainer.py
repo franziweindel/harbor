@@ -868,12 +868,17 @@ class ApptainerEnvironment(BaseEnvironment):
                         sif_copy = rec.get("sif")
                         if sif_copy and Path(sif_copy).exists():
                             self.logger.info(f"[apptainer] reusing cached SIF {sif_copy}")
+                            # BUGFIX (local patch): do NOT return here — the
+                            # instance start below must still run. The early
+                            # return made cached-SIF trials skip instance
+                            # startup entirely, so every exec then failed with
+                            # "no instance found".
                             self._sif_path = Path(sif_copy)
-                            return
                 except Exception as e:
                     self.logger.warning(f"[apptainer] cache lookup failed, rebuilding: {e}")
             # Convert Dockerfile to Singularity definition and build
-            self._sif_path = await self._build_from_dockerfile(force=force_build)
+            if self._sif_path is None:
+                self._sif_path = await self._build_from_dockerfile(force=force_build)
         else:
             raise FileNotFoundError(
                 f"No container definition found for Apptainer environment. "
