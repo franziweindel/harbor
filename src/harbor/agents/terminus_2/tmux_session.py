@@ -66,6 +66,13 @@ class TmuxSession:
         # unique name (host /tmp may be shared across instances).
         import uuid as _uuid
         self._socket_path = Path("/tmp") / f"harbor_tmux_{_uuid.uuid4().hex[:12]}.sock"
+        # LOCAL PATCH (anchored tmux): if the environment advertises an
+        # anchored per-instance tmux server (started by the apptainer shim
+        # from a persistent exec, surviving across execs), use its socket.
+        _anchor = getattr(environment, "harbor_tmux_socket", None)
+        self._anchored_server = bool(_anchor)
+        if _anchor:
+            self._socket_path = Path(_anchor)
         # User-space tools directory for rootless container environments (e.g., podman)
         # This is inside /logs/agent/ which is mounted and writable
         self._tools_dir = self._logging_path.parent / ".tools"
@@ -699,7 +706,34 @@ class TmuxSession:
         # switch to a fresh socket, and retry.
         import uuid as _uuid
         dummy_ok = False
-        for _attempt in range(3):
+        # LOCAL PATCH (anchored tmux): with an anchored server the shim's
+        # persistent exec already runs the tmux server on our socket — do NOT
+        # create one from a short-lived exec (it would die with the exec).
+        # Wait for the anchor to come up (it polls for tmux being installed,
+        # which we just did), then skip the dummy bootstrap entirely.
+        if self._anchored_server:
+            for _ in range(90):
+                probe = await self.environment.exec(
+                    command=(
+                        f"timeout 10 {tmux} -S {self._socket_path} "
+                        f"list-sessions >/dev/null 2>&1 && echo ANCHOR_UP"
+                    )
+                )
+                if "ANCHOR_UP" in (probe.stdout or ""):
+                    dummy_ok = True
+                    break
+                await asyncio.sleep(1.0)
+            if not dummy_ok:
+                self._logger.warning(
+                    "Anchored tmux server on %s did not come up in 90s; "
+                    "falling back to per-exec bootstrap (likely broken on "
+                    "this host).", self._socket_path,
+                )
+                self._anchored_server = False
+                self._socket_path = (
+                    Path("/tmp") / f"harbor_tmux_{_uuid.uuid4().hex[:12]}.sock"
+                )
+        for _attempt in range(0 if dummy_ok else 3):
             dummy_result = await self.environment.exec(
                 command=(
                     f'timeout 60 script -qc "{tmux} -S {self._socket_path} '
