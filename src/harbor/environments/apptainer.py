@@ -161,6 +161,16 @@ class ApptainerEnvironment(BaseEnvironment):
         # Instance name must be alphanumeric with underscores/dashes
         self._instance_name = self._sanitize_instance_name(session_id)
 
+        # LOCAL PATCH (anchored tmux): on hosts where processes spawned by
+        # `apptainer exec` die with the exec (observed on Apptainer 1.5 +
+        # Slurm), a tmux server cannot be started by a short-lived exec. The
+        # apptainer_patch shim anchors a per-instance tmux server on this
+        # deterministic socket from a persistent exec. TmuxSession picks the
+        # attribute up via getattr. Gated on HARBOR_TMUX_ANCHOR=1 so docker /
+        # legacy hosts are untouched.
+        if os.environ.get("HARBOR_TMUX_ANCHOR") == "1":
+            self.harbor_tmux_socket = f"/tmp/harbor_tmux_{self._instance_name}.sock"
+
         # Path to the SIF image file
         self._sif_path: Optional[Path] = None
 
