@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 
 from harbor.environments.apptainer import ApptainerEnvironment
+from harbor.environments.apptainer_bridge import ApptainerBridgeEnvironment
 from harbor.environments.apple_container import AppleContainerEnvironment
 from harbor.environments.base import BaseEnvironment
 from harbor.environments.docker.docker import DockerEnvironment
@@ -70,6 +71,7 @@ except ImportError:
 class EnvironmentFactory:
     _ENVIRONMENTS: list[type[BaseEnvironment]] = [
         ApptainerEnvironment,
+        ApptainerBridgeEnvironment,
         AppleContainerEnvironment,
         DockerEnvironment,
         PodmanHPCEnvironment,

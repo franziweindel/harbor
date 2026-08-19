@@ -1,4 +1,11 @@
-"""Bridge-backed Apptainer environment for HPC clusters.
+"""Bridge-backed Apptainer environment for HPC clusters (APPTAINER_BRIDGE).
+
+Ported from marin-community/harbor@41f4320c (harbor/environments/apptainer/
+apptainer.py) onto this fork's older internals. Adaptations, all mechanical:
+EnvironmentCapabilities -> the fork's supports_gpus/can_disable_internet/
+is_mounted properties; EnvironmentType.APPTAINER_BRIDGE (the local env keeps
+APPTAINER); _merge_env/_resolve_user inlined (fork base has no default_user).
+server.py / worker.py are stdlib-only and vendored unmodified.
 
 ``ApptainerEnvironment`` is a Harbor :class:`BaseEnvironment` that does **not**
 run Apptainer locally. Instead it delegates every lifecycle operation (start,
@@ -32,7 +39,6 @@ import urllib.request
 from pathlib import Path
 
 from harbor.environments.base import BaseEnvironment, ExecResult
-from harbor.environments.capabilities import EnvironmentCapabilities
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
@@ -138,7 +144,7 @@ async def _poll_job(
     raise TimeoutError(f"Bridge job {job_id} timed out after {timeout_sec}s")
 
 
-class ApptainerEnvironment(BaseEnvironment):
+class ApptainerBridgeEnvironment(BaseEnvironment):
     """Harbor environment backed by remote Apptainer instances via a bridge.
 
     Lifecycle operations are submitted to the bridge server, which dispatches
@@ -186,14 +192,22 @@ class ApptainerEnvironment(BaseEnvironment):
 
     @staticmethod
     def type() -> EnvironmentType:
-        return EnvironmentType.APPTAINER
+        return EnvironmentType.APPTAINER_BRIDGE
+
+    # CPU-only HPC nodes; the bridge can run isolated (no-internet)
+    # containers. Not "mounted": files live on the remote cluster, so the
+    # verifier must download results rather than read a host bind mount.
+    @property
+    def supports_gpus(self) -> bool:
+        return False
 
     @property
-    def capabilities(self) -> EnvironmentCapabilities:
-        # CPU-only HPC nodes; the bridge can run isolated (no-internet)
-        # containers. Not "mounted": files live on the remote cluster, so the
-        # verifier must download results rather than read a host bind mount.
-        return EnvironmentCapabilities(gpus=False, disable_internet=True)
+    def can_disable_internet(self) -> bool:
+        return True
+
+    @property
+    def is_mounted(self) -> bool:
+        return False
 
     @property
     def _dockerfile_path(self) -> Path:
@@ -288,6 +302,22 @@ class ApptainerEnvironment(BaseEnvironment):
             f"[bridge] Waiting for workers... {dead_duration:.0f}s / "
             f"{self._workers_dead_timeout:.0f}s"
         )
+
+
+    def _resolve_user(self, user: str | int | None) -> str | int | None:
+        # Fork base has no default_user machinery; pass through explicitly
+        # requested users only.
+        return user
+
+    def _merge_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
+        """Merge persistent env vars with per-exec env vars (per-exec wins)."""
+        persistent = getattr(self, "_persistent_env", None) or {}
+        if not persistent and not env:
+            return None
+        merged = {**persistent}
+        if env:
+            merged.update(env)
+        return merged or None
 
     async def start(self, force_build: bool) -> None:
         """Create a remote Apptainer instance via the bridge.

@@ -10,5 +10,6 @@ class EnvironmentType(str, Enum):
     RUNLOOP = "runloop"
     GKE = "gke"
     APPTAINER = "apptainer"
+    APPTAINER_BRIDGE = "apptainer_bridge"
     BEAM = "beam"
     APPLE_CONTAINER = "apple-container"
