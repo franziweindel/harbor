@@ -637,7 +637,18 @@ class ApptainerEnvironment(BaseEnvironment):
 
         if sif_path.exists() and not force:
             self.logger.info(f"Using cached built SIF: {sif_path}")
+            self._link_short_name(sif_path, dockerfile_hash)
             return sif_path
+
+        # LOCAL PATCH (cross-generation cache reuse): marin-generation harbor
+        # (bridge mode) names the same image build_<task>-<sha256[:12]>.sif.
+        # Both hash the same Dockerfile bytes, so an image built there is a
+        # valid cache hit here — accept it instead of rebuilding.
+        short_path = self._get_sif_path(
+            f"build_{self.environment_name}-{dockerfile_hash[:12]}")
+        if short_path.exists() and not force:
+            self.logger.info(f"Using cached built SIF (short name): {short_path}")
+            return short_path
 
         lock = self._image_pull_locks.setdefault(
             f"build_{self.environment_name}", asyncio.Lock()
@@ -732,7 +743,28 @@ class ApptainerEnvironment(BaseEnvironment):
                 except Exception:
                     pass
 
+        # Publish the marin-style short name so bridge-mode workers reuse this
+        # image instead of rebuilding it (see _link_short_name).
+        self._link_short_name(sif_path, dockerfile_hash)
         return sif_path
+
+    def _link_short_name(self, sif_path: Path, df_hash: str) -> None:
+        """Symlink build_<task>-<hash[:12]>.sif -> build_<task>-<hash>.sif.
+
+        Local mode (this generation) names images with the full sha256;
+        marin-generation harbor (bridge mode) looks for the 12-char truncation
+        of the same hash. The symlink makes one cache serve both. Best-effort:
+        never fail a build over it.
+        """
+        try:
+            if len(df_hash) <= 12:
+                return
+            short = sif_path.with_name(
+                sif_path.name.replace(f"-{df_hash}.sif", f"-{df_hash[:12]}.sif"))
+            if short != sif_path and not short.exists():
+                short.symlink_to(sif_path)
+        except Exception:
+            pass
 
     async def _build_from_def(self, def_file: Path, force: bool = False) -> Path:
         """Build SIF from a Singularity definition file.
