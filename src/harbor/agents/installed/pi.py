@@ -14,6 +14,10 @@ from harbor.agents.installed.base import (
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.agent.name import AgentName
+from harbor_config.env import (
+    CAPABILITY_TOKEN_PATH_PREFIX,
+    CAPABILITY_TOKEN_REDACTION,
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,10 @@ class Pi(BaseInstalledAgent):
     _API_KEY_ENV = "HARBOR_PI_API_KEY"
     _ENDPOINT_ENV_PATH = "/tmp/harbor-pi-endpoint.env"
     _PROVIDER_CONFIG_RELATIVE_PATH = ".pi/agent/models.json"
+    _OUTPUT_REDACTOR = (
+        f"stdbuf -oL sed -E 's#({CAPABILITY_TOKEN_PATH_PREFIX})"
+        f"[^/[:space:]\"]+#\\1{CAPABILITY_TOKEN_REDACTION}#g'"
+    )
     _REGISTER_PROVIDER_SCRIPT = """
 const fs = require("fs");
 const path = require("path");
@@ -287,7 +295,7 @@ fs.writeFileSync(configPath, JSON.stringify(config));
         if skills_command:
             await self.exec_as_agent(environment, command=skills_command)
 
-        endpoint_command = ""
+        runtime_prelude = "set -o pipefail; . ~/.nvm/nvm.sh; "
         if self._api_base is not None:
             if provider_command is None:
                 raise ValueError(
@@ -296,20 +304,22 @@ fs.writeFileSync(configPath, JSON.stringify(config));
             await self._stage_endpoint_env(environment)
             endpoint_path = shlex.quote(self._ENDPOINT_ENV_PATH)
             provider_path = f'"$HOME/{self._PROVIDER_CONFIG_RELATIVE_PATH}"'
-            endpoint_command = (
+            runtime_prelude = (
                 "set -e; "
                 f"trap 'rm -f {endpoint_path} {provider_path}' EXIT; "
+                f"{runtime_prelude}"
                 f". {endpoint_path}; {provider_command}; rm -f {endpoint_path}; "
             )
         await self.exec_as_agent(
             environment,
             command=(
-                f"{endpoint_command}. ~/.nvm/nvm.sh; "
+                f"{runtime_prelude}"
                 f"pi --print --mode json --no-session "
                 f"{model_args}"
                 f"{cli_flags}"
                 f"{escaped_instruction} "
-                f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/{self._OUTPUT_FILENAME}"
+                f"2>&1 </dev/null | {self._OUTPUT_REDACTOR} | "
+                f"stdbuf -oL tee /logs/agent/{self._OUTPUT_FILENAME}"
             ),
             env=env,
         )
