@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import asyncio.subprocess
+import json
 import os
 import re
 import shlex
@@ -713,6 +714,44 @@ class ApptainerEnvironment(BaseEnvironment):
                             # Continue to try without fakeroot
 
                 if not build_succeeded:
+                    # LOCAL PATCH (registry-import fallback): some base images
+                    # cannot run %post under rootless apptainer at all — the
+                    # injected fakeroot shim needs shared libraries the image
+                    # lacks (seen with mcr.microsoft.com/dotnet/sdk:6.0:
+                    # "exec /.singularity.d/libs/fakeroot failed"). Importing
+                    # from a registry needs no root (and is the ZIH-documented
+                    # path), so: build the BASE image from docker://, and defer
+                    # the Dockerfile's RUN steps to instance start, where the
+                    # instance has a writable overlay. The deferred steps are
+                    # persisted in a sidecar next to the SIF so a later cache
+                    # hit still replays them.
+                    try:
+                        base_image, run_cmds, _copies, env_vars, workdir = \
+                            self._parse_dockerfile(dockerfile)
+                        self.logger.warning(
+                            f"Dockerfile build failed; importing base image "
+                            f"docker://{base_image} and deferring "
+                            f"{len(run_cmds)} RUN step(s) to instance start.")
+                        await self._run_apptainer_command(
+                            ["build", str(temp_sif), f"docker://{base_image}"],
+                            env=build_env,
+                        )
+                        temp_sif.rename(sif_path)
+                        sif_path.with_suffix(".deferred.json").write_text(
+                            json.dumps({"run": run_cmds, "env": env_vars,
+                                        "workdir": workdir,
+                                        "base_image": base_image}, indent=2))
+                        build_succeeded = True
+                        self.logger.info(
+                            f"Built SIF from registry base with deferred RUN "
+                            f"steps: {sif_path}")
+                    except Exception as e:
+                        if temp_sif.exists():
+                            temp_sif.unlink()
+                        self.logger.warning(
+                            f"Registry-import fallback also failed: {e}")
+
+                if not build_succeeded:
                     # Provide more helpful error message
                     raise ApptainerCommandError(
                         f"Failed to build SIF from Dockerfile. "
@@ -964,6 +1003,44 @@ class ApptainerEnvironment(BaseEnvironment):
         # Register instance for cleanup tracking
         self._register_instance()
         self.logger.info(f"Started Apptainer instance: {self._instance_name}")
+        await self._replay_deferred_build_steps()
+
+    async def _replay_deferred_build_steps(self) -> None:
+        """Run Dockerfile RUN steps that could not run at build time.
+
+        Written by the registry-import fallback in _build_from_dockerfile: the
+        image was imported from docker:// without executing %post, so the RUN
+        steps happen here instead, inside the started instance (writable
+        overlay). No-op when there is no sidecar, i.e. for normally built SIFs.
+        """
+        if not self._sif_path:
+            return
+        sidecar = Path(str(self._sif_path)).with_suffix(".deferred.json")
+        if not sidecar.exists():
+            return
+        try:
+            spec = json.loads(sidecar.read_text())
+        except Exception as e:
+            self.logger.warning(f"Unreadable deferred-build sidecar {sidecar}: {e}")
+            return
+        prefix = "".join(f"export {k}={shlex.quote(str(v))}; "
+                         for k, v in (spec.get("env") or {}).items())
+        workdir = spec.get("workdir") or "/workspace"
+        for i, run_cmd in enumerate(spec.get("run") or [], 1):
+            script = f"{prefix}cd {shlex.quote(workdir)} 2>/dev/null || true; {run_cmd}"
+            self.logger.info(
+                f"[deferred-build {i}] {run_cmd[:120]}"
+                f"{'...' if len(run_cmd) > 120 else ''}")
+            try:
+                await self._run_apptainer_command(
+                    ["exec", f"instance://{self._instance_name}",
+                     "bash", "-lc", script],
+                )
+            except Exception as e:
+                # A failed setup step is a task-environment problem, not an
+                # infrastructure crash: log loudly and let the trial proceed
+                # so the failure surfaces in the trial's own result.
+                self.logger.warning(f"[deferred-build {i}] FAILED: {e}")
 
     async def stop(self, delete: bool) -> None:
         """Stop the Apptainer instance."""
