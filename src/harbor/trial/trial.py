@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from harbor.agents.factory import AgentFactory
 from harbor.environments.base import BaseEnvironment
@@ -24,7 +25,7 @@ from harbor.models.trial.config import (
     ServiceVolumeConfig,
     TrialConfig,
 )
-from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
+from harbor.models.trial.paths import EnvironmentPaths
 from harbor.models.trial.result import (
     ExceptionInfo,
     StepResult,
@@ -35,14 +36,16 @@ from harbor.models.verifier.result import VerifierResult
 from harbor.skills import ResolvedSkill, resolve_skills
 from harbor.tasks.client import TaskClient
 from harbor.trial.artifact_handler import ArtifactHandler
+from harbor.trial.attempt import trial_paths
 from harbor.trial.errors import (
     AgentSetupTimeoutError,
     AgentTimeoutError,
     EnvironmentStartTimeoutError,
     TrialNotScoredError,
+    VerifierTimeoutError,
     VerificationNotCompletedError,
 )
-from harbor.trial.hooks import TrialEvent, TrialHookEvent
+from harbor.trial.hooks import TrialEvent, TrialHookEvent, emit_trial_hooks
 from harbor.utils.artifact_writer import get_artifact_writer
 from harbor.utils.logger import logger as global_logger
 from harbor.utils.scripts import quote_shell_arg
@@ -80,6 +83,24 @@ def _log_abandoned_stop_failure(
     stop_task.add_done_callback(_log)
 
 
+def _log_abandoned_phase_failure(
+    phase_task: "asyncio.Task[Any]", logger: logging.Logger
+) -> None:
+    """Report a late failure from a cancellation-resistant trial phase."""
+
+    def _log(task: "asyncio.Task[Any]") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "Abandoned trial phase failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    phase_task.add_done_callback(_log)
+
+
 class Trial(ABC):
     """Base trial lifecycle.
 
@@ -94,6 +115,7 @@ class Trial(ABC):
         config: TrialConfig,
         *,
         _task: Task | None = None,
+        _attempt_index: int | None = None,
     ):
         if _task is None:
             raise ValueError(
@@ -105,7 +127,8 @@ class Trial(ABC):
         self.job_id = config.job_id
         self.task = _task
 
-        self.paths = TrialPaths(trial_dir=(config.trials_dir / config.trial_name))
+        self.paths = trial_paths(config, _attempt_index)
+        self._attempt_index = _attempt_index
         self.paths.mkdir()
 
         self.agent_env_paths = EnvironmentPaths.for_os(self.task.config.environment.os)
@@ -121,6 +144,8 @@ class Trial(ABC):
         self._reached_verifier = False
         self._result: TrialResult | None = None
         self._log_handler: logging.Handler | None = None
+        self._first_phase_timeout: asyncio.TimeoutError | None = None
+        self._pending_cleanup_tasks: set[asyncio.Task[Any]] = set()
 
         self._init_logger()
         self._init_timeouts()
@@ -134,21 +159,38 @@ class Trial(ABC):
             raise RuntimeError("Trial result accessed before initialization")
         return self._result
 
+    @property
+    def has_result(self) -> bool:
+        return self._result is not None
+
     @staticmethod
     def _now() -> datetime:
         return datetime.now(timezone.utc)
 
     @classmethod
-    async def create(cls, config: TrialConfig) -> "Trial":
+    async def create(
+        cls, config: TrialConfig, *, attempt_index: int | None = None
+    ) -> "Trial":
         task = await cls._load_task(config)
         if task.has_steps:
             from harbor.trial.multi_step import MultiStepTrial
 
-            return MultiStepTrial(config, _task=task)
+            return MultiStepTrial(config, _task=task, _attempt_index=attempt_index)
 
         from harbor.trial.single_step import SingleStepTrial
 
-        return SingleStepTrial(config, _task=task)
+        return SingleStepTrial(config, _task=task, _attempt_index=attempt_index)
+
+    @property
+    def first_phase_timeout(self) -> asyncio.TimeoutError | None:
+        return self._first_phase_timeout
+
+    def pending_cleanup_tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        return tuple(task for task in self._pending_cleanup_tasks if not task.done())
+
+    def _track_cleanup_task(self, task: asyncio.Task[Any]) -> None:
+        self._pending_cleanup_tasks.add(task)
+        task.add_done_callback(self._pending_cleanup_tasks.discard)
 
     @staticmethod
     async def _load_task(config: TrialConfig) -> Task:
@@ -178,15 +220,14 @@ class Trial(ABC):
         self._hooks[event].append(hook)
 
     async def _emit(self, event: TrialEvent) -> None:
-        hook_event = TrialHookEvent(
+        await emit_trial_hooks(
+            self._hooks[event],
             event=event,
             trial_id=self.config.trial_name,
             task_name=self.task.name,
             config=self.config,
-            result=self._result,
+            result=self.result,
         )
-        for hook in self._hooks[event]:
-            await hook(hook_event)
 
     async def run(self) -> TrialResult:
         await self._init_result()
@@ -232,7 +273,7 @@ class Trial(ABC):
         await self._stop_agent_environment()
         await self._enforce_verifier_result_invariant()
         self.result.finished_at = self._now()
-        # result.json is written to the (remote, s3://) trials_dir. Route it
+        # The lifecycle result is written to the (remote, s3://) trials_dir. Route it
         # through the bounded artifact writer (NOT asyncio.to_thread: the
         # default executor fills up under concurrent trials and starves every
         # other to_thread user), then flush everything still queued for this
@@ -240,14 +281,19 @@ class Trial(ABC):
         # trial's durable record is complete before the trial reports finished.
         result_json = self.result.model_dump_json(indent=4)
         writer = get_artifact_writer()
+        result_path = (
+            self.paths.result_path
+            if self._attempt_index is None
+            else self.paths.lifecycle_result_path
+        )
         result_future = writer.submit(
-            self.paths.result_path,
+            result_path,
             lambda: result_json,
             description="trial result.json",
         )
         await writer.aflush(prefix=str(self.paths.trial_dir))
         # Other artifacts are best-effort (failures are logged by the writer),
-        # but a missing result.json must fail the trial loudly.
+        # but a missing lifecycle result must fail the trial loudly.
         result_error = result_future.exception()
         if result_error is not None:
             raise result_error
@@ -397,20 +443,62 @@ class Trial(ABC):
                 self.agent_environment.with_default_user(user),
                 self.agent_environment.with_agent_timeout(timeout_sec),
             ):
-                await asyncio.wait_for(
+                error = AgentTimeoutError(
+                    f"Agent execution timed out after {timeout_sec} seconds"
+                )
+                await self._await_phase(
                     self.agent.run(
                         instruction=instruction,
                         environment=self.agent_environment,
                         context=target.agent_result,
                     ),
-                    timeout=timeout_sec,
+                    timeout_sec=timeout_sec,
+                    timeout_error=error,
                 )
-        except asyncio.TimeoutError as exc:
-            raise AgentTimeoutError(
-                f"Agent execution timed out after {timeout_sec} seconds"
-            ) from exc
         finally:
             target.agent_execution.finished_at = self._now()
+
+    async def _await_phase(
+        self,
+        awaitable: Awaitable[Any],
+        *,
+        timeout_sec: float | None,
+        timeout_error: asyncio.TimeoutError,
+    ) -> Any:
+        if timeout_sec is None:
+            return await awaitable
+
+        task = asyncio.ensure_future(awaitable)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout_sec)
+        except asyncio.CancelledError:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                self.logger.exception(
+                    "Trial phase failed while handling attempt cancellation"
+                )
+            raise
+        if task in done:
+            return await task
+
+        if self._first_phase_timeout is None:
+            self._first_phase_timeout = timeout_error
+        task.cancel()
+        self._track_cleanup_task(task)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                raise timeout_error from None
+            _log_abandoned_phase_failure(task, self.logger)
+            raise
+        except Exception as error:
+            raise timeout_error from error
+        raise timeout_error
 
     async def _download_agent_logs(self) -> None:
         """Best-effort sync of diagnostic logs for host-side analysis.
@@ -485,7 +573,13 @@ class Trial(ABC):
                 verifier_env=env,
                 step_name=step_name,
             )
-            return await asyncio.wait_for(verifier.verify(), timeout=timeout_sec)
+            return await self._await_phase(
+                verifier.verify(),
+                timeout_sec=timeout_sec,
+                timeout_error=VerifierTimeoutError(
+                    f"Verifier execution timed out after {timeout_sec} seconds"
+                ),
+            )
 
     async def _run_separate_verifier(
         self,
@@ -550,7 +644,13 @@ class Trial(ABC):
                     skip_tests_upload=True,
                 )
 
-                return await asyncio.wait_for(verifier.verify(), timeout=timeout_sec)
+                return await self._await_phase(
+                    verifier.verify(),
+                    timeout_sec=timeout_sec,
+                    timeout_error=VerifierTimeoutError(
+                        f"Verifier execution timed out after {timeout_sec} seconds"
+                    ),
+                )
 
     @contextlib.asynccontextmanager
     async def _separate_verifier_env(
@@ -593,6 +693,11 @@ class Trial(ABC):
                     f"{ENVIRONMENT_STOP_TIMEOUT_SEC}s"
                 )
                 _log_abandoned_stop_failure(stop_task, self.logger, key)
+                self._track_cleanup_task(stop_task)
+            except asyncio.CancelledError:
+                _log_abandoned_stop_failure(stop_task, self.logger, key)
+                self._track_cleanup_task(stop_task)
+                raise
             except Exception:
                 self.logger.exception("Failed to stop verifier env '%s'", key)
 
@@ -670,7 +775,7 @@ class Trial(ABC):
             task_name=self.task.name,
             task_id=self.config.task.get_task_id(),
             started_at=self._now(),
-            config=self.config,
+            config=persisted_config,
             task_checksum=self.task.checksum,
             trial_uri=self.paths.trial_dir.expanduser().resolve().as_uri(),
             agent_info=self.agent.to_agent_info(),
@@ -732,11 +837,15 @@ class Trial(ABC):
         )
 
     def _init_agent_environment(self) -> None:
+        session_id = self.config.trial_name
+        attempt_index = self._attempt_index
+        if attempt_index is not None:
+            session_id = f"{session_id}__attempt_{attempt_index}"
         self.agent_environment = EnvironmentFactory.create_environment_from_config(
             config=self.config.environment,
             environment_dir=self.task.paths.environment_dir,
             environment_name=self.task.short_name,
-            session_id=self.config.trial_name,
+            session_id=session_id,
             trial_paths=self.paths,
             task_env_config=self.task.config.environment,
             logger=self.logger,
@@ -765,6 +874,8 @@ class Trial(ABC):
             verifier=self._verifier_timeout_sec,
             agent_setup=self._agent_setup_timeout_sec,
             environment_build=self._environment_build_timeout_sec,
+            trial_attempt=self.config.trial_attempt_timeout_sec,
+            trial_cleanup_grace=self.config.trial_cleanup_grace_sec,
         )
 
     def _compute_agent_timeout_sec(self) -> float | None:
@@ -878,17 +989,17 @@ class Trial(ABC):
             self.result.environment_setup.finished_at = self._now()
 
     async def _start_agent_environment(self) -> None:
-        try:
-            await asyncio.wait_for(
-                self.agent_environment.start(
-                    force_build=self.config.environment.force_build
-                ),
-                timeout=self._environment_build_timeout_sec,
-            )
-        except asyncio.TimeoutError as exc:
-            raise EnvironmentStartTimeoutError(
-                f"Environment start timed out after {self._environment_build_timeout_sec} seconds"
-            ) from exc
+        error = EnvironmentStartTimeoutError(
+            "Environment start timed out after "
+            f"{self._environment_build_timeout_sec} seconds"
+        )
+        await self._await_phase(
+            self.agent_environment.start(
+                force_build=self.config.environment.force_build
+            ),
+            timeout_sec=self._environment_build_timeout_sec,
+            timeout_error=error,
+        )
 
     async def _setup_agent(self) -> None:
         if (
@@ -903,14 +1014,14 @@ class Trial(ABC):
 
         self.result.agent_setup = TimingInfo(started_at=self._now())
         try:
-            await asyncio.wait_for(
-                self.agent.setup(environment=self.agent_environment),
-                timeout=self._agent_setup_timeout_sec,
-            )
-        except asyncio.TimeoutError as exc:
-            raise AgentSetupTimeoutError(
+            error = AgentSetupTimeoutError(
                 f"Agent setup timed out after {self._agent_setup_timeout_sec} seconds"
-            ) from exc
+            )
+            await self._await_phase(
+                self.agent.setup(environment=self.agent_environment),
+                timeout_sec=self._agent_setup_timeout_sec,
+                timeout_error=error,
+            )
         finally:
             self.result.agent_setup.finished_at = self._now()
 
@@ -936,6 +1047,7 @@ class Trial(ABC):
                 f"after {ENVIRONMENT_STOP_TIMEOUT_SEC}s"
             )
             _log_abandoned_stop_failure(stop_task, self.logger, self.config.trial_name)
+            self._track_cleanup_task(stop_task)
         except asyncio.CancelledError:
             self._is_agent_environment_stopped = True
             self.logger.debug(
@@ -943,6 +1055,7 @@ class Trial(ABC):
                 "but agent environment stop is shielded and will complete"
             )
             _log_abandoned_stop_failure(stop_task, self.logger, self.config.trial_name)
+            self._track_cleanup_task(stop_task)
         except Exception as exc:
             self._is_agent_environment_stopped = True
             self.logger.exception(

@@ -153,6 +153,7 @@ async def test_finalize_writes_result_json_off_event_loop(
     writer = _ThreadRecordingWriter(tmp_path / "result.json")
 
     trial = object.__new__(SingleStepTrial)
+    trial._attempt_index = None
     trial._stop_agent_environment = AsyncMock()  # type: ignore[attr-defined]
     # Round-3: _enforce_verifier_result_invariant is now async (it offloads its
     # own exception.txt write off the loop), so _finalize awaits it.
@@ -203,6 +204,8 @@ async def test_init_result_skips_remote_mkdir_and_offloads_config_write(
         "verifier": 600,
         "agent_setup": 360,
         "environment_build": 600,
+        "trial_attempt": None,
+        "trial_cleanup_grace": 30.0,
         "steps": [],
     }
 
