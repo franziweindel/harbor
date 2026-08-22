@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from harbor.agents.base import BaseAgent
-from harbor.environments.base import BaseEnvironment
+from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.utils.env import parse_bool_env_value
 from harbor.utils.templating import render_prompt_template
 
@@ -14,7 +14,14 @@ from harbor.utils.templating import render_prompt_template
 class NonZeroAgentExitCodeError(RuntimeError):
     """Raised when the agent process exits with a non-zero exit code."""
 
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: ExecResult | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 class ModelAuthenticationError(NonZeroAgentExitCodeError):
@@ -29,20 +36,16 @@ class ModelAuthenticationError(NonZeroAgentExitCodeError):
 
 
 class AgentKilledBySignalError(NonZeroAgentExitCodeError):
-    """The agent command was terminated by a signal (exit code ``128 + N``).
+    """Raised when an agent command exits with the shell's signal status."""
 
-    A distinct, classified subtype of :class:`NonZeroAgentExitCodeError` so an
-    agent process that was *killed by a signal* (e.g. the agent's own tool call
-    ran a ``kill -HUP`` that hit its process group and terminated the CLI —
-    exit 129 = 128 + SIGHUP; or an OOM kill — exit 137 = 128 + SIGKILL) is
-    visible + truthfully typed in ``exception_stats`` rather than folded into a
-    generic non-zero exit. It subclasses ``NonZeroAgentExitCodeError`` so every
-    existing handler (the single-step agent-phase passthrough that still runs
-    the verifier, the retry filter) keeps treating it the same way.
-    """
-
-    def __init__(self, message: str, *, signal_number: int | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        signal_number: int | None = None,
+        result: ExecResult | None = None,
+    ) -> None:
+        super().__init__(message, result=result)
         self.signal_number = signal_number
 
 
@@ -355,9 +358,11 @@ class BaseInstalledAgent(BaseAgent, ABC):
             # a generic non-zero exit.
             if 128 < result.return_code <= 128 + 64:
                 raise AgentKilledBySignalError(
-                    message, signal_number=result.return_code - 128
+                    message,
+                    signal_number=result.return_code - 128,
+                    result=result,
                 )
-            raise NonZeroAgentExitCodeError(message)
+            raise NonZeroAgentExitCodeError(message, result=result)
 
         self.logger.debug(
             "Command outputs captured",
