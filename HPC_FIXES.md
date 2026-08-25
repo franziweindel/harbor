@@ -98,5 +98,18 @@ goes into a separate overlay file next to it. At trial time that overlay is
 mounted read-only on top of the SIF, so every trial starts from an image that
 already has everything installed and nothing is installed again.
 
+The overlay is created with `--sparse`, so its nominal size is a ceiling
+rather than a reservation (2GB nominal, ~50MB on disk for these packages).
+
 Verified on ZIH Capella: `task_10016`, which never built before, now scores
 reward 1 with 19/19 of its tests passing.
+
+## 8. SIF cache location
+
+`_DEFAULT_CACHE_DIR` was hard-coded to `~/.apptainer/harbor_cache`, so pointing
+the cache at cluster storage meant symlinking that path. On ZIH that backfires:
+filesystem visibility is per-node (`/data/horse` was mounted on one Capella node
+and missing on another), and a symlink into an unmounted filesystem dangles —
+harbor then dies with `FileExistsError` on its own cache directory. Fix: honour
+`HARBOR_SIF_CACHE`, so the consuming pipeline can pick a directory the node can
+actually reach.
