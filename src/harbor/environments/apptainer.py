@@ -105,7 +105,13 @@ class ApptainerEnvironment(BaseEnvironment):
     """
 
     # Cache directory for SIF images (avoids re-pulling)
-    _DEFAULT_CACHE_DIR = Path.home() / ".apptainer" / "harbor_cache"
+    # LOCAL PATCH: HARBOR_SIF_CACHE lets a cluster point the SIF cache at a
+    # filesystem that is actually mounted on the node the job landed on,
+    # without symlinking harbor's default path (a symlink into an unmounted
+    # filesystem just dangles, and mkdir on it fails with FileExistsError).
+    _DEFAULT_CACHE_DIR = Path(
+        os.environ.get("HARBOR_SIF_CACHE")
+        or Path.home() / ".apptainer" / "harbor_cache")
 
     # Class-level lock per image to prevent parallel pulls
     _image_pull_locks: dict[str, asyncio.Lock] = {}
@@ -153,7 +159,7 @@ class ApptainerEnvironment(BaseEnvironment):
         task_kwargs = getattr(task_env_config, "kwargs", {}) or {}
         self._merged_kwargs: dict = {**task_kwargs, **kwargs}
 
-        self._cache_dir = cache_dir or self._DEFAULT_CACHE_DIR
+        self._cache_dir = Path(cache_dir) if cache_dir else self._DEFAULT_CACHE_DIR
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._keep_instances = keep_instances
