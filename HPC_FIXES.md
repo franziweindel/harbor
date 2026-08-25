@@ -88,13 +88,15 @@ root when it does `chown`/`chmod`. That preload has to link against the glibc
 inside the image; against bullseye's glibc it fails to load and the build dies.
 
 Fix: import the base image with `apptainer build … docker://<base>` (no
-`%post`, no fakeroot) and handle the Dockerfile's own steps separately. Moving
-the `RUN` steps to instance start and running them in the image did not work;
-instead run them once under `unshare -r` (creates a new user namespace where
-our uid is mapped to 0, i.e. root) and capture the result in a persistent
-overlay image next to the SIF. That overlay is mounted read-only at trial time,
-so every trial starts from an image that already has everything installed and
-nothing has to be installed again.
+`%post`, no fakeroot) and run the Dockerfile's own steps separately. Moving them
+to instance start and running them in the image did not work. Instead they run
+once inside a new user namespace created with `unshare -r`, where our uid is
+mapped to 0 — so `apt-get` and `dpkg` see a real root and install normally,
+without any fakeroot shim that would have to load against the image's old libs.
+What they install is not written back into the SIF, which stays immutable: it
+goes into a separate overlay file next to it. At trial time that overlay is
+mounted read-only on top of the SIF, so every trial starts from an image that
+already has everything installed and nothing is installed again.
 
 Verified on ZIH Capella: `task_10016`, which never built before, now scores
 reward 1 with 19/19 of its tests passing.
