@@ -99,7 +99,7 @@ mounted read-only on top of the SIF, so every trial starts from an image that
 already has everything installed and nothing is installed again.
 
 The overlay is created with `--sparse`, so it only takes up as much disk as is
-actually written to it (~50MB here, not the 2GB it is allowed to grow to).
+actually written to it; its nominal size is a ceiling, not a reservation.
 
 Verified on ZIH Capella: `task_10016`, which never built before, now scores
 reward 1 with 19/19 of its tests passing.
