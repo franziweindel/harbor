@@ -177,6 +177,8 @@ class ApptainerEnvironment(BaseEnvironment):
 
         # Staging directory for file transfers (bind-mounted into container)
         self._staging_dir: Optional[Path] = None
+        self._deferred_copy_dir: Optional[Path] = None
+        self._deferred_copy_binds: list[str] = []
 
         # Track whether instance has been started (for cleanup tracking)
         self._instance_started = False
@@ -882,6 +884,9 @@ class ApptainerEnvironment(BaseEnvironment):
         if self._staging_dir:
             binds.append(f"{self._staging_dir}:/staging:rw")
 
+        # Writable copies of a registry-imported image's COPY payload
+        binds.extend(self._deferred_copy_binds)
+
         return binds
 
     def _build_resource_args(self) -> list[str]:
@@ -970,6 +975,8 @@ class ApptainerEnvironment(BaseEnvironment):
                 f"3) Dockerfile in {self.environment_dir}"
             )
 
+        self._prepare_deferred_copies()
+
         # Build instance start command
         cmd = ["instance", "start"]
 
@@ -1014,6 +1021,49 @@ class ApptainerEnvironment(BaseEnvironment):
         self._register_instance()
         self.logger.info(f"Started Apptainer instance: {self._instance_name}")
 
+    def _prepare_deferred_copies(self) -> None:
+        """Stage a registry-imported image's COPY payload as writable binds.
+
+        The Dockerfile's COPY steps cannot go into the deferred overlay: it is
+        baked as namespace-root, and these images cannot run with --fakeroot, so
+        the trial itself is an unprivileged user. fuse-overlayfs copy-up of
+        root-owned content then needs CAP_CHOWN and fails with EPERM the moment
+        a task writes next to its own files. Binding a per-instance copy over
+        each destination sidesteps the overlay entirely: the files belong to the
+        user running the trial, exactly as a Docker build's COPY would behave.
+        """
+        self._deferred_copy_binds = []
+        if not self._sif_path:
+            return
+        sidecar = Path(str(self._sif_path)).with_suffix(".deferred.json")
+        if not sidecar.exists():
+            return
+        copy_cmds = json.loads(sidecar.read_text()).get("copy") or []
+        if not copy_cmds:
+            return
+        self._deferred_copy_dir = Path(
+            tempfile.mkdtemp(prefix="harbor_deferred_copy_"))
+        for i, copy_cmd in enumerate(copy_cmds):
+            parts = shlex.split(copy_cmd)
+            if len(parts) < 2:
+                continue
+            dest = parts[-1]
+            for j, src in enumerate(parts[:-1]):
+                src_path = (self.environment_dir / src).resolve()
+                if not src_path.exists():
+                    self.logger.warning(f"COPY source not found: {src_path}")
+                    continue
+                local = self._deferred_copy_dir / f"{i}_{j}_{src_path.name}"
+                if src_path.is_dir():
+                    shutil.copytree(src_path, local)
+                else:
+                    shutil.copy2(src_path, local)
+                self._deferred_copy_binds.append(f"{local}:{dest}:rw")
+        if self._deferred_copy_binds:
+            self.logger.info(
+                f"Staged {len(self._deferred_copy_binds)} deferred COPY "
+                f"destination(s) as writable binds")
+
     async def _deferred_overlay_path(self) -> Path | None:
         """Overlay holding the setup of a registry-imported image, or None.
 
@@ -1046,8 +1096,7 @@ class ApptainerEnvironment(BaseEnvironment):
         """
         spec = json.loads(sif_path.with_suffix(".deferred.json").read_text())
         run_cmds = spec.get("run") or []
-        copy_cmds = spec.get("copy") or []
-        if not run_cmds and not copy_cmds:
+        if not run_cmds:
             return
         overlay = sif_path.with_suffix(".overlay.img")
         temp_overlay = Path(f"{overlay}.{os.getpid()}.tmp")
@@ -1067,29 +1116,8 @@ class ApptainerEnvironment(BaseEnvironment):
         for k, v in (spec.get("env") or {}).items():
             prelude += f"export {k}={shlex.quote(str(v))}\n"
         workdir = spec.get("workdir") or "/"
-        # COPY: the build context is bound read-only at _CTX; Docker copies the
-        # CONTENTS of a source directory into the destination.
-        ctx = "/harbor_build_ctx"
-        copy_script = ""
-        for copy_cmd in copy_cmds:
-            parts = shlex.split(copy_cmd)
-            if len(parts) < 2:
-                continue
-            dest = parts[-1]
-            for src in parts[:-1]:
-                s = shlex.quote(f"{ctx}/{src.lstrip('./')}")
-                d = shlex.quote(dest)
-                copy_script += (
-                    f"if [ -d {s} ]; then mkdir -p {d} && cp -a {s}/. {d}/; "
-                    f"else mkdir -p \"$(dirname {d})\" && cp -a {s} {d}; fi\n"
-                    # The bake runs as namespace-root, so everything it writes
-                    # is root-owned; the trial itself runs as the invoking user
-                    # (these images cannot use --fakeroot at all). Task content
-                    # must therefore stay writable for that user.
-                    f"chmod -R a+rwX {d}\n")
         script = prelude + f"cd {shlex.quote(workdir)} 2>/dev/null || true\n" + \
-            "\n".join(run_cmds) + ("\n" if run_cmds else "") + copy_script + \
-            f"chmod a+rwX {shlex.quote(workdir)} 2>/dev/null || true\n"
+            "\n".join(run_cmds) + "\n"
 
         self.logger.info(
             f"Baking {len(run_cmds)} deferred build step(s) into {overlay.name} "
@@ -1100,7 +1128,6 @@ class ApptainerEnvironment(BaseEnvironment):
                  str(temp_overlay)])
             await self._run_unshared(
                 [binary, "exec", "--overlay", str(temp_overlay), "--cleanenv",
-                 "--bind", f"{self.environment_dir}:{ctx}:ro",
                  "--pwd", "/", str(sif_path), "bash", "-lc", script])
         except Exception:
             temp_overlay.unlink(missing_ok=True)
@@ -1148,6 +1175,8 @@ class ApptainerEnvironment(BaseEnvironment):
             # Clean up staging directory
             if self._staging_dir and self._staging_dir.exists():
                 shutil.rmtree(self._staging_dir, ignore_errors=True)
+            if self._deferred_copy_dir and self._deferred_copy_dir.exists():
+                shutil.rmtree(self._deferred_copy_dir, ignore_errors=True)
 
             # Optionally delete cached SIF
             if delete and self._sif_path and self._sif_path.exists():
