@@ -88,10 +88,14 @@ before the fix.
 - Nothing on the driver side (`apptainer.py`); `server.py` only gains the
   recorded queue key of §4.
 - The one-`exec`-per-action model. The local-mode fork needed a persistent
-  "anchor" exec because on Apptainer 1.5 a tmux server started by one exec
-  is killed when that exec exits. The oracle does not use tmux, so the
-  loopback does not exercise this; it is the open risk for agent (student)
-  runs through the bridge and is to be verified next.
+  "anchor" exec because there a tmux server started by one exec was killed
+  when that exec exited. Through the bridge worker this does not happen:
+  probed on ZIH Julia and Alpha (fakeroot instance, Apptainer 1.5) — a tmux server
+  started in one exec is still listed by the next exec, and `send-keys`
+  from a third exec runs the command. An agent run (terminus-2 on Qwen3-8B,
+  Alpha, 2 tasks) confirms it end to end: one task solved (reward 1), the
+  other a genuine model failure (it declared the task complete after one
+  batch). No anchor is needed on the bridge side.
 
 ## Verified on ZIH
 
