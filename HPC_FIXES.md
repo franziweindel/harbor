@@ -80,37 +80,22 @@ RUN apt-get update && apt-get install -y curl git vim && rm -rf /var/lib/apt/lis
 
 That base image is built on old Debian (bullseye).
 
-Apptainer converts a Dockerfile into a `.def` file and runs the `RUN` lines
-in a `%post` section. Since you have no entry in `/etc/subuid` (no root on
-ZIH), Apptainer falls back to its fakeroot shim: it `LD_PRELOAD`s a small
-library into every command so that `apt-get` believes it's root when it does
-`chown`/`chmod`. That preload has to link against the glibc inside the image.
-In bullseye's glibc it fails to load, so every command in `%post` dies before
-it starts — the build fails. In `dotnet/sdk:8.0` (bookworm) the same
-Dockerfile builds fine, which is why it's 1 image out of 200 and not a
-general apt problem.
+Apptainer converts a Dockerfile into a `.def` file and runs the `RUN` lines in
+a `%post` section. With no root on the cluster it falls back to fakeroot, which
+preloads a small library into every command so that `apt-get` believes it is
+root when it does `chown`/`chmod`. That preload has to link against the glibc
+inside the image; against bullseye's glibc it fails to load and the build dies.
+The same Dockerfile on `dotnet/sdk:8.0` (bookworm) builds fine, which is why
+it's 1 image out of 200 and not a general apt problem.
 
-Asking admins for a subuid entry is a non-starter, and ZIH's docs point at
-the alternative themselves: "It is not possible for users to generate new
-custom containers on ZIH systems directly, because creating a new container
-requires root privileges", but "importing from Docker does not require root
-privileges and therefore works on ZIH systems directly."
-
-Fix: a third build strategy in `_build_from_dockerfile`, tried only after
-both existing attempts fail — move the privileged work out of build time
-(no root available) into run time (inside the instance you are already root
-in your own user namespace):
-
-1. parse the Dockerfile → base image + `RUN`/`ENV`/`WORKDIR`,
-2. `apptainer build … docker://<base>` — a plain registry import, no
-   `%post`, no fakeroot,
-3. persist the skipped `RUN` steps in a `<sif>.deferred.json` sidecar next
-   to the SIF,
-4. replay them inside the started instance (writable overlay) via
-   `_replay_deferred_build_steps()`, which also fires on later cache hits so
-   a cached SIF never silently skips its setup. A failing setup step warns
-   rather than raising, so it surfaces as a task result (reward 0) instead of
-   an infra error.
+Fix: move the privileged work out of build time, where no root is available,
+into run time. A third build strategy in `_build_from_dockerfile`, tried only
+after both existing attempts fail, imports the base image with
+`apptainer build … docker://<base>` (no `%post`, no fakeroot), stores the
+skipped `RUN` steps in a `<sif>.deferred.json` sidecar, and replays them inside
+the started instance — also on later cache hits, so a cached SIF never silently
+skips its setup. A failing setup step warns rather than raising, so it surfaces
+as a task result instead of an infra error.
 
 Status: build path verified on `task_10016` (fallback fires, SIF and sidecar
 cached correctly). The run path is not validated yet — the trial still dies
