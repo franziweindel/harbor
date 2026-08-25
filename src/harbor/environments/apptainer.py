@@ -1124,8 +1124,8 @@ class ApptainerEnvironment(BaseEnvironment):
             f"({size_mb}MB overlay, rootless via unshare -r)")
         try:
             await self._run_unshared(
-                [binary, "overlay", "create", "--size", str(size_mb),
-                 str(temp_overlay)])
+                [binary, "overlay", "create", "--sparse", "--size",
+                 str(size_mb), str(temp_overlay)])
             await self._run_unshared(
                 [binary, "exec", "--overlay", str(temp_overlay), "--cleanenv",
                  "--pwd", "/", str(sif_path), "bash", "-lc", script])
