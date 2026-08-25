@@ -85,19 +85,14 @@ a `%post` section. With no root on the cluster it falls back to fakeroot, which
 preloads a small library into every command so that `apt-get` believes it is
 root when it does `chown`/`chmod`. That preload has to link against the glibc
 inside the image; against bullseye's glibc it fails to load and the build dies.
-The same Dockerfile on `dotnet/sdk:8.0` (bookworm) builds fine, which is why
-it's 1 image out of 200 and not a general apt problem.
 
 Fix: move the privileged work out of build time, where no root is available,
 into run time. A third build strategy in `_build_from_dockerfile`, tried only
 after both existing attempts fail, imports the base image with
 `apptainer build … docker://<base>` (no `%post`, no fakeroot), stores the
 skipped `RUN` steps in a `<sif>.deferred.json` sidecar, and replays them inside
-the started instance — also on later cache hits, so a cached SIF never silently
+the started instance also on later cache hits, so a cached SIF never silently
 skips its setup. A failing setup step warns rather than raising, so it surfaces
 as a task result instead of an infra error.
 
-Status: build path verified on `task_10016` (fallback fires, SIF and sidecar
-cached correctly). The run path is not validated yet — the trial still dies
-earlier, in `apptainer instance start --fakeroot`, so the deferred steps have
-not actually executed on a real trial.
+
