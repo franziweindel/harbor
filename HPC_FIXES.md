@@ -98,8 +98,12 @@ goes into a separate overlay file next to it. At trial time that overlay is
 mounted read-only on top of the SIF, so every trial starts from an image that
 already has everything installed and nothing is installed again.
 
-The overlay is created with `--sparse`, so it only takes up as much disk as is
-actually written to it; its nominal size is a ceiling, not a reservation.
+The overlay is created with `--sparse`, so where the filesystem supports it the
+file only takes up as much disk as is actually written to it. Not every one
+does: on ZIH, sparse files work on `/data/horse` and on node-local disk, but
+`/data/cat` allocates the full nominal size regardless. Keep
+`HARBOR_DEFERRED_OVERLAY_MB` (default 2048) in mind on such a filesystem — it is
+a per-image cost there, not a ceiling.
 
 Verified on ZIH Capella: `task_10016`, which never built before, now scores
 reward 1 with 19/19 of its tests passing.
