@@ -741,6 +741,7 @@ class ApptainerEnvironment(BaseEnvironment):
                             json.dumps({"run": run_cmds, "env": env_vars,
                                         "workdir": workdir,
                                         "base_image": base_image}, indent=2))
+                        await self._bake_deferred_overlay(sif_path)
                         build_succeeded = True
                         self.logger.info(
                             f"Built SIF from registry base with deferred RUN "
@@ -985,8 +986,16 @@ class ApptainerEnvironment(BaseEnvironment):
         # Add GPU support
         cmd.extend(self._build_gpu_args())
 
-        # Add fakeroot if requested
-        if self._use_fakeroot:
+        # LOCAL PATCH: a registry-imported image (see the fallback in
+        # _build_from_dockerfile) cannot use --fakeroot at all — apptainer's
+        # fakeroot helper fails to exec against the image's old libraries, so
+        # the instance never starts. Its setup instead lives in a persistent
+        # overlay baked at build time, mounted read-only here; --writable-tmpfs
+        # gives the trial its own writable layer on top.
+        overlay = await self._deferred_overlay_path()
+        if overlay is not None:
+            cmd.extend(["--overlay", f"{overlay}:ro", "--writable-tmpfs"])
+        elif self._use_fakeroot:
             cmd.append("--fakeroot")
 
         # Clean environment to avoid host pollution
@@ -1003,48 +1012,93 @@ class ApptainerEnvironment(BaseEnvironment):
         # Register instance for cleanup tracking
         self._register_instance()
         self.logger.info(f"Started Apptainer instance: {self._instance_name}")
-        await self._replay_deferred_build_steps()
 
-    async def _replay_deferred_build_steps(self) -> None:
-        """Run Dockerfile RUN steps that could not run at build time.
+    async def _deferred_overlay_path(self) -> Path | None:
+        """Overlay holding the setup of a registry-imported image, or None.
 
-        Written by the registry-import fallback in _build_from_dockerfile: the
-        image was imported from docker:// without executing %post, so the RUN
-        steps happen here instead, inside the started instance (writable
-        overlay). No-op when there is no sidecar, i.e. for normally built SIFs.
+        Registry-imported SIFs (see the fallback in _build_from_dockerfile) have
+        a .deferred.json sidecar listing the Dockerfile RUN steps that could not
+        run at build time. Those steps live in a persistent overlay image next
+        to the SIF; bake it on first use so a cached SIF never starts without
+        its setup.
         """
         if not self._sif_path:
+            return None
+        sif = Path(str(self._sif_path))
+        if not sif.with_suffix(".deferred.json").exists():
+            return None
+        overlay = sif.with_suffix(".overlay.img")
+        if not overlay.exists():
+            await self._bake_deferred_overlay(sif)
+        return overlay
+
+    async def _bake_deferred_overlay(self, sif_path: Path) -> None:
+        """Run the deferred Dockerfile RUN steps into a persistent overlay.
+
+        Rootless recipe verified on ZIH Capella (Apptainer 1.5, no /etc/subuid):
+        `unshare -r` maps our uid to 0, which is real root inside the namespace,
+        so dpkg is happy — unlike apptainer's fakeroot helper, which cannot even
+        exec against these images. apt still needs config help there: it drops
+        privileges to the unmapped `_apt` uid and writes to `_apt`-owned cache
+        directories, neither of which works in a single-uid namespace, so an
+        apt.conf drop-in keeps it as root and points its caches at fresh dirs.
+        """
+        spec = json.loads(sif_path.with_suffix(".deferred.json").read_text())
+        run_cmds = spec.get("run") or []
+        if not run_cmds:
             return
-        sidecar = Path(str(self._sif_path)).with_suffix(".deferred.json")
-        if not sidecar.exists():
-            return
+        overlay = sif_path.with_suffix(".overlay.img")
+        temp_overlay = Path(f"{overlay}.{os.getpid()}.tmp")
+        size_mb = int(os.environ.get("HARBOR_DEFERRED_OVERLAY_MB", "2048"))
+        binary = _get_container_binary()
+
+        prelude = (
+            "set -e\n"
+            "mkdir -p /opt/aptcache/archives/partial /opt/aptcache/lists/partial\n"
+            "if [ -d /etc/apt ]; then\n"
+            "  printf '%s\\n' 'APT::Sandbox::User \"root\";' "
+            "'Dir::Cache::archives \"/opt/aptcache/archives/\";' "
+            "'Dir::State::lists \"/opt/aptcache/lists/\";' "
+            "> /etc/apt/apt.conf.d/00-harbor-rootless\n"
+            "fi\n"
+        )
+        for k, v in (spec.get("env") or {}).items():
+            prelude += f"export {k}={shlex.quote(str(v))}\n"
+        workdir = spec.get("workdir") or "/"
+        script = prelude + f"cd {shlex.quote(workdir)} 2>/dev/null || true\n" + \
+            "\n".join(run_cmds) + "\n"
+
+        self.logger.info(
+            f"Baking {len(run_cmds)} deferred build step(s) into {overlay.name} "
+            f"({size_mb}MB overlay, rootless via unshare -r)")
         try:
-            spec = json.loads(sidecar.read_text())
-        except Exception as e:
-            raise RuntimeError(
-                f"Unreadable deferred-build sidecar {sidecar}: {e}"
-            ) from e
-        prefix = "".join(f"export {k}={shlex.quote(str(v))}; "
-                         for k, v in (spec.get("env") or {}).items())
-        workdir = spec.get("workdir") or "/workspace"
-        for i, run_cmd in enumerate(spec.get("run") or [], 1):
-            script = f"{prefix}cd {shlex.quote(workdir)} 2>/dev/null || true; {run_cmd}"
-            self.logger.info(
-                f"[deferred-build {i}] {run_cmd[:120]}"
-                f"{'...' if len(run_cmd) > 120 else ''}")
-            try:
-                await self._run_apptainer_command(
-                    ["exec", f"instance://{self._instance_name}",
-                     "bash", "-lc", script],
-                )
-            except Exception as e:
-                # Fail loudly: a container whose setup did not run cannot
-                # fairly evaluate an agent, and a silent reward 0 would be
-                # indistinguishable from a genuine agent failure.
-                msg = (f"Deferred build step {i} failed for image "
-                       f"{spec.get('base_image')}: {run_cmd}")
-                self.logger.error(f"{msg} ({e})")
-                raise RuntimeError(msg) from e
+            await self._run_unshared(
+                [binary, "overlay", "create", "--size", str(size_mb),
+                 str(temp_overlay)])
+            await self._run_unshared(
+                [binary, "exec", "--overlay", str(temp_overlay), "--cleanenv",
+                 str(sif_path), "bash", "-lc", script])
+        except Exception:
+            temp_overlay.unlink(missing_ok=True)
+            raise
+        temp_overlay.replace(overlay)
+        self.logger.info(f"Deferred build steps baked into {overlay}")
+
+    async def _run_unshared(self, command: list[str]) -> None:
+        """Run a command in a root-mapped user namespace (`unshare -r`)."""
+        process = await asyncio.create_subprocess_exec(
+            "unshare", "-r", *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise ApptainerCommandError(
+                f"unshare -r {' '.join(command[:3])} ... failed "
+                f"(exit {process.returncode}): "
+                f"{stderr.decode(errors='replace')[-2000:]}"
+                f"{stdout.decode(errors='replace')[-500:]}")
 
     async def stop(self, delete: bool) -> None:
         """Stop the Apptainer instance."""
