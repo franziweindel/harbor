@@ -92,7 +92,7 @@ after both existing attempts fail, imports the base image with
 `apptainer build … docker://<base>` (no `%post`, no fakeroot), stores the
 skipped `RUN` steps in a `<sif>.deferred.json` sidecar, and replays them inside
 the started instance also on later cache hits, so a cached SIF never silently
-skips its setup. A failing setup step warns rather than raising, so it surfaces
-as a task result instead of an infra error.
+skips its setup. A failing setup step aborts the trial with a
+named error rather than leaving a container that quietly lacks its setup.
 
 

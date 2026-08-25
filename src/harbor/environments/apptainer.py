@@ -1021,8 +1021,9 @@ class ApptainerEnvironment(BaseEnvironment):
         try:
             spec = json.loads(sidecar.read_text())
         except Exception as e:
-            self.logger.warning(f"Unreadable deferred-build sidecar {sidecar}: {e}")
-            return
+            raise RuntimeError(
+                f"Unreadable deferred-build sidecar {sidecar}: {e}"
+            ) from e
         prefix = "".join(f"export {k}={shlex.quote(str(v))}; "
                          for k, v in (spec.get("env") or {}).items())
         workdir = spec.get("workdir") or "/workspace"
@@ -1037,10 +1038,13 @@ class ApptainerEnvironment(BaseEnvironment):
                      "bash", "-lc", script],
                 )
             except Exception as e:
-                # A failed setup step is a task-environment problem, not an
-                # infrastructure crash: log loudly and let the trial proceed
-                # so the failure surfaces in the trial's own result.
-                self.logger.warning(f"[deferred-build {i}] FAILED: {e}")
+                # Fail loudly: a container whose setup did not run cannot
+                # fairly evaluate an agent, and a silent reward 0 would be
+                # indistinguishable from a genuine agent failure.
+                msg = (f"Deferred build step {i} failed for image "
+                       f"{spec.get('base_image')}: {run_cmd}")
+                self.logger.error(f"{msg} ({e})")
+                raise RuntimeError(msg) from e
 
     async def stop(self, delete: bool) -> None:
         """Stop the Apptainer instance."""
