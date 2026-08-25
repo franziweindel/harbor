@@ -98,18 +98,22 @@ goes into a separate overlay file next to it. At trial time that overlay is
 mounted read-only on top of the SIF, so every trial starts from an image that
 already has everything installed and nothing is installed again.
 
-The overlay is created with `--sparse`, so its nominal size is a ceiling
-rather than a reservation (2GB nominal, ~50MB on disk for these packages).
+The overlay is created with `--sparse`, so it only takes up as much disk as is
+actually written to it (~50MB here, not the 2GB it is allowed to grow to).
 
 Verified on ZIH Capella: `task_10016`, which never built before, now scores
 reward 1 with 19/19 of its tests passing.
 
 ## 8. SIF cache location
 
-`_DEFAULT_CACHE_DIR` was hard-coded to `~/.apptainer/harbor_cache`, so pointing
-the cache at cluster storage meant symlinking that path. On ZIH that backfires:
-filesystem visibility is per-node (`/data/horse` was mounted on one Capella node
-and missing on another), and a symlink into an unmounted filesystem dangles —
-harbor then dies with `FileExistsError` on its own cache directory. Fix: honour
-`HARBOR_SIF_CACHE`, so the consuming pipeline can pick a directory the node can
-actually reach.
+The SIF cache path was hard-coded to `~/.apptainer/harbor_cache`, so the only
+way to move it onto cluster storage was to make that path a symlink. A symlink
+is one fixed target for every job, and on ZIH the right target differs per job:
+`/data/cat` exists only on Capella, `/data/horse` is the one the other clusters
+see, and neither is guaranteed on a given node (horse was mounted on one Capella
+node and missing on another). Pointing the one symlink at a filesystem the node
+does not have makes harbor die on its own cache directory, and rewriting the
+symlink per job races when several jobs run at once.
+
+Fix: honour `HARBOR_SIF_CACHE`. The cache path becomes an environment variable —
+per job, not per machine — so each run picks a directory that node can reach.
