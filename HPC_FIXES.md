@@ -86,29 +86,13 @@ preloads a small library into every command so that `apt-get` believes it is
 root when it does `chown`/`chmod`. That preload has to link against the glibc
 inside the image; against bullseye's glibc it fails to load and the build dies.
 
-Fix: move the privileged work out of build time, where no root is available,
-into run time. A third build strategy in `_build_from_dockerfile`, tried only
-after both existing attempts fail, imports the base image with
-`apptainer build … docker://<base>` (no `%post`, no fakeroot) and records the
-skipped Dockerfile steps in a `<sif>.deferred.json` sidecar.
-
-Replaying those steps at every instance start does NOT work, so the `RUN` steps
-are instead baked ONCE into a persistent overlay image beside the SIF, executed
-under `unshare -r`: that maps our uid to 0, which is real root inside the
-namespace, so dpkg is happy — unlike apptainer's fakeroot helper, which cannot
-even exec against these images. apt needs two nudges there, because a
-single-uid namespace has no `_apt` user: keep it running as root and point its
-cache directories somewhere fresh. The bake also happens on a later cache hit,
-so a cached SIF never starts without its setup, and a failing step raises like
-any other environment error — reward `None` and a named error, not a silent
-reward 0 that is indistinguishable from a weak agent.
-
-Two consequences at trial time. Such an image starts WITHOUT `--fakeroot`: with
-it, the instance does not start at all ("exec /.singularity.d/libs/fakeroot
-failed"), so the trial runs as the invoking user. And the `COPY` payload is
-bind-mounted from a per-instance copy instead of being baked into the overlay,
-because overlay copy-up of root-owned content needs CAP_CHOWN and fails the
-moment a task writes next to its own files.
+Fix: import the base image with `apptainer build … docker://<base>` (no
+`%post`, no fakeroot) and handle the Dockerfile's own steps separately. Moving
+the `RUN` steps to instance start and running them in the image did not work;
+instead bake them once under `unshare -r` (real uid 0 in the namespace) into a
+persistent overlay image next to the SIF, mount it read-only at trial time,
+start without `--fakeroot`, and bind the `COPY` payload separately so it stays
+writable.
 
 Verified on ZIH Capella: `task_10016`, which never built before, now scores
 reward 1 with 19/19 of its tests passing.
