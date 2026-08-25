@@ -90,11 +90,10 @@ inside the image; against bullseye's glibc it fails to load and the build dies.
 Fix: import the base image with `apptainer build … docker://<base>` (no
 `%post`, no fakeroot) and handle the Dockerfile's own steps separately. Moving
 the `RUN` steps to instance start and running them in the image did not work;
-instead run them once under `unshare -r` (real uid 0 in the namespace),
-capturing the result in a persistent overlay image next to the SIF that is
-mounted read-only at trial time,
-start without `--fakeroot`, and bind the `COPY` payload separately so it stays
-writable.
+instead run them once under `unshare -r` (real uid 0 in the namespace) and
+capture the result in a persistent overlay image next to the SIF, mounted
+read-only at trial time. Such an image starts without `--fakeroot`, and the
+`COPY` payload is bound in separately so it stays writable.
 
 Verified on ZIH Capella: `task_10016`, which never built before, now scores
 reward 1 with 19/19 of its tests passing.
