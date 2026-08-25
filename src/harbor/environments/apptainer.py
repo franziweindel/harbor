@@ -726,7 +726,7 @@ class ApptainerEnvironment(BaseEnvironment):
                     # persisted in a sidecar next to the SIF so a later cache
                     # hit still replays them.
                     try:
-                        base_image, run_cmds, _copies, env_vars, workdir = \
+                        base_image, run_cmds, copies, env_vars, workdir = \
                             self._parse_dockerfile(dockerfile)
                         self.logger.warning(
                             f"Dockerfile build failed; importing base image "
@@ -738,8 +738,8 @@ class ApptainerEnvironment(BaseEnvironment):
                         )
                         temp_sif.rename(sif_path)
                         sif_path.with_suffix(".deferred.json").write_text(
-                            json.dumps({"run": run_cmds, "env": env_vars,
-                                        "workdir": workdir,
+                            json.dumps({"run": run_cmds, "copy": copies,
+                                        "env": env_vars, "workdir": workdir,
                                         "base_image": base_image}, indent=2))
                         await self._bake_deferred_overlay(sif_path)
                         build_succeeded = True
@@ -990,11 +990,12 @@ class ApptainerEnvironment(BaseEnvironment):
         # _build_from_dockerfile) cannot use --fakeroot at all — apptainer's
         # fakeroot helper fails to exec against the image's old libraries, so
         # the instance never starts. Its setup instead lives in a persistent
-        # overlay baked at build time, mounted read-only here; --writable-tmpfs
-        # gives the trial its own writable layer on top.
+        # overlay baked at build time, mounted read-only here. No
+        # --writable-tmpfs: apptainer refuses it alongside another writable
+        # overlay, which the caller (e.g. an HPC shim) may already supply.
         overlay = await self._deferred_overlay_path()
         if overlay is not None:
-            cmd.extend(["--overlay", f"{overlay}:ro", "--writable-tmpfs"])
+            cmd.extend(["--overlay", f"{overlay}:ro"])
         elif self._use_fakeroot:
             cmd.append("--fakeroot")
 
@@ -1045,7 +1046,8 @@ class ApptainerEnvironment(BaseEnvironment):
         """
         spec = json.loads(sif_path.with_suffix(".deferred.json").read_text())
         run_cmds = spec.get("run") or []
-        if not run_cmds:
+        copy_cmds = spec.get("copy") or []
+        if not run_cmds and not copy_cmds:
             return
         overlay = sif_path.with_suffix(".overlay.img")
         temp_overlay = Path(f"{overlay}.{os.getpid()}.tmp")
@@ -1065,8 +1067,29 @@ class ApptainerEnvironment(BaseEnvironment):
         for k, v in (spec.get("env") or {}).items():
             prelude += f"export {k}={shlex.quote(str(v))}\n"
         workdir = spec.get("workdir") or "/"
+        # COPY: the build context is bound read-only at _CTX; Docker copies the
+        # CONTENTS of a source directory into the destination.
+        ctx = "/harbor_build_ctx"
+        copy_script = ""
+        for copy_cmd in copy_cmds:
+            parts = shlex.split(copy_cmd)
+            if len(parts) < 2:
+                continue
+            dest = parts[-1]
+            for src in parts[:-1]:
+                s = shlex.quote(f"{ctx}/{src.lstrip('./')}")
+                d = shlex.quote(dest)
+                copy_script += (
+                    f"if [ -d {s} ]; then mkdir -p {d} && cp -a {s}/. {d}/; "
+                    f"else mkdir -p \"$(dirname {d})\" && cp -a {s} {d}; fi\n"
+                    # The bake runs as namespace-root, so everything it writes
+                    # is root-owned; the trial itself runs as the invoking user
+                    # (these images cannot use --fakeroot at all). Task content
+                    # must therefore stay writable for that user.
+                    f"chmod -R a+rwX {d}\n")
         script = prelude + f"cd {shlex.quote(workdir)} 2>/dev/null || true\n" + \
-            "\n".join(run_cmds) + "\n"
+            "\n".join(run_cmds) + ("\n" if run_cmds else "") + copy_script + \
+            f"chmod a+rwX {shlex.quote(workdir)} 2>/dev/null || true\n"
 
         self.logger.info(
             f"Baking {len(run_cmds)} deferred build step(s) into {overlay.name} "
@@ -1077,7 +1100,8 @@ class ApptainerEnvironment(BaseEnvironment):
                  str(temp_overlay)])
             await self._run_unshared(
                 [binary, "exec", "--overlay", str(temp_overlay), "--cleanenv",
-                 str(sif_path), "bash", "-lc", script])
+                 "--bind", f"{self.environment_dir}:{ctx}:ro",
+                 "--pwd", "/", str(sif_path), "bash", "-lc", script])
         except Exception:
             temp_overlay.unlink(missing_ok=True)
             raise
