@@ -70,7 +70,8 @@ child step.
 
 ## 7. Images whose build steps can't run rootless
 
-One task, `task_10016`. Its Dockerfile is:
+One task, `task_10016` from the Terminal-Lego dataset
+(`SWE-Lego/Terminal-Lego-15k`). Its Dockerfile is:
 
 ```dockerfile
 FROM mcr.microsoft.com/dotnet/sdk:6.0
@@ -89,8 +90,9 @@ inside the image; against bullseye's glibc it fails to load and the build dies.
 Fix: import the base image with `apptainer build … docker://<base>` (no
 `%post`, no fakeroot) and handle the Dockerfile's own steps separately. Moving
 the `RUN` steps to instance start and running them in the image did not work;
-instead bake them once under `unshare -r` (real uid 0 in the namespace) into a
-persistent overlay image next to the SIF, mount it read-only at trial time,
+instead run them once under `unshare -r` (real uid 0 in the namespace),
+capturing the result in a persistent overlay image next to the SIF that is
+mounted read-only at trial time,
 start without `--fakeroot`, and bind the `COPY` payload separately so it stays
 writable.
 
