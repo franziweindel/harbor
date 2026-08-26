@@ -9,11 +9,11 @@ How the bridge works, for orientation: Harbor's driver never runs `apptainer`
 itself. It POSTs start/exec/upload/stop requests to a small HTTP relay
 (`server.py`); `worker.py` processes on compute nodes poll that relay, own the
 Apptainer instances, and run every command in them. Everything below is on the
-worker side, i.e. inside those instances. The test that all of this is
-measured against is the "loopback": relay, two workers and the driver on one
-node, running each task's golden solution and then its verifier (the oracle)
-for three Terminal-Lego tasks. Before the fixes the oracle scored 0/3, after
-them 3/3.
+worker side, i.e. inside those instances. Each fix was isolated with the
+oracle (golden solution, then verifier) on three Terminal-Lego tasks, first
+with relay, workers and driver on one node ("loopback", so the network is not
+a variable), then with relay and workers on a different cluster than the
+driver; the table at the end lists every configuration and its result.
 
 ## 1. Tasks need root inside the container
 
