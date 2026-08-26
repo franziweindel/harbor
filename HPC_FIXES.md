@@ -110,14 +110,23 @@ reward 1 with 19/19 of its tests passing.
 
 ## 8. SIF cache location
 
-The SIF cache path was hard-coded to `~/.apptainer/harbor_cache`, so the only
-way to move it onto cluster storage was to make that path a symlink. A symlink
-is one fixed target for every job, and on ZIH the right target differs per job:
-`/data/cat` exists only on Capella, `/data/horse` is the one the other clusters
-see, and neither is guaranteed on a given node (horse was mounted on one Capella
-node and missing on another). Pointing the one symlink at a filesystem the node
+The cache matters: harbor builds one SIF per task image, and the trial wraps
+the whole environment build in the task's `build_timeout_sec` (600 s default,
+`[environment]` in `task.toml`). Building from a Dockerfile plus `apt`/`pip`
+on a compute node regularly takes longer than that, so an uncached task can
+fail its build before the agent ever starts. With the SIF cached, the start
+takes seconds. For a proxy run over hundreds of tasks the cache is therefore
+a precondition, not an optimisation.
+
+The cache path was hard-coded to `~/.apptainer/harbor_cache`, so the only way
+to put it on cluster storage was to make that path a symlink. A symlink is one
+fixed target for every job, and on ZIH the right target differs per job:
+`/data/cat` exists only on Capella, `/data/horse` is what the other clusters
+see, and neither is guaranteed on a given node (horse was mounted on one
+Capella node and missing on another). A symlink into a filesystem the node
 does not have makes harbor die on its own cache directory, and rewriting the
 symlink per job races when several jobs run at once.
 
-Fix: honour `HARBOR_SIF_CACHE`. The cache path becomes an environment variable —
-per job, not per machine — so each run picks a directory that node can reach.
+Fix: the cache path is read from `HARBOR_SIF_CACHE` (falling back to the old
+default). It becomes a per-job setting instead of a per-machine one, so each
+run points at a directory its node can reach.
