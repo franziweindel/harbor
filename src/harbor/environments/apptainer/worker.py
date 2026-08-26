@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import queue
@@ -127,6 +128,108 @@ def _patch_test_sh_for_offline_pip(workspace):
             f"under {workspace} (wheels={wheels_dir})",
             flush=True,
         )
+
+
+# --- Images whose build steps cannot run rootless -----------------------------
+# Some base images (old Debian, e.g. mcr.microsoft.com/dotnet/sdk:6.0) cannot
+# run `%post` under apptainer's fakeroot at all: the injected helper cannot
+# load against the image's old glibc ("exec /.singularity.d/libs/fakeroot
+# failed"), and without fakeroot apt/dpkg refuse. For those, _build_sif
+# imports the BASE image from the registry (needs no root) and defers the
+# Dockerfile's RUN steps: they are baked once into a persistent overlay next
+# to the SIF, inside a root-mapped user namespace (`unshare -r`, no helper
+# preload), and every instance mounts that overlay read-only. Sidecar and
+# overlay share the local-mode fork's naming, so caches are interchangeable.
+
+def _parse_copies(dockerfile_path):
+    """COPY/ADD steps of a Dockerfile as (sources, dest) tuples (flags dropped)."""
+    copies = []
+    with open(dockerfile_path) as f:
+        for line in f:
+            stripped = line.strip()
+            up = stripped.upper()
+            if not (up.startswith("COPY ") or up.startswith("ADD ")):
+                continue
+            parts = stripped.split()[1:]
+            while parts and parts[0].startswith("--"):
+                parts = parts[1:]
+            if len(parts) >= 2:
+                copies.append((parts[:-1], parts[-1]))
+    return copies
+
+def _deferred_sidecar(sif):
+    real = os.path.realpath(sif)
+    return (real[:-4] if real.endswith(".sif") else real) + ".deferred.json"
+
+
+def _deferred_overlay(sif):
+    real = os.path.realpath(sif)
+    return (real[:-4] if real.endswith(".sif") else real) + ".overlay.img"
+
+
+def _run_unshared(cmd, timeout=3600):
+    r = subprocess.run(["unshare", "-r", *cmd], capture_output=True, text=True,
+                       timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"unshare -r {' '.join(cmd[:3])} ... failed (exit {r.returncode}): "
+            f"{r.stderr[-1500:]}{r.stdout[-300:]}")
+
+
+def _bake_deferred_overlay(sif):
+    """Return the overlay holding the deferred RUN steps, baking it on first use."""
+    overlay = _deferred_overlay(sif)
+    if os.path.exists(overlay):
+        return overlay
+    with open(_deferred_sidecar(sif)) as f:
+        spec = json.load(f)
+    run_cmds = spec.get("run") or []
+    lock_path = overlay + ".lock"
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # several workers may hit the same image
+        if os.path.exists(overlay):
+            return overlay
+        tmp = f"{overlay}.{os.getpid()}.tmp"
+        size_mb = os.environ.get("BRIDGE_DEFERRED_OVERLAY_MB", "2048")
+        prelude = (
+            "set -e\n"
+            "mkdir -p /opt/aptcache/archives/partial /opt/aptcache/lists/partial\n"
+            "if [ -d /etc/apt ]; then printf '%s\\n' 'APT::Sandbox::User \"root\";' "
+            "'Dir::Cache::archives \"/opt/aptcache/archives/\";' "
+            "'Dir::State::lists \"/opt/aptcache/lists/\";' "
+            "> /etc/apt/apt.conf.d/00-harbor-rootless; fi\n"
+            # Docker images ship a post-invoke hook that rm's the original
+            # archives dir, which is owned by the unmapped _apt uid: apt then
+            # exits 100 after installing. Drop the hook.
+            "rm -f /etc/apt/apt.conf.d/docker-clean\n"
+        )
+        # What _build_sif's %post always adds for the terminus agent — but
+        # AFTER the Dockerfile's steps and non-fatal: tmux pulls libutempter0,
+        # whose package chowns a file to a non-root uid, which a single-uid
+        # namespace cannot do; dpkg then stays broken for every later apt call.
+        epilogue = (
+            "\n(apt-get install -y -qq tmux asciinema || apt-get -f install -y -qq) "
+            ">/dev/null 2>&1 || true\n"
+        )
+        for k, v in (spec.get("env") or {}).items():
+            prelude += f"export {k}={shlex.quote(str(v))}\n"
+        workdir = spec.get("workdir") or "/"
+        script = (prelude + f"mkdir -p {shlex.quote(workdir)}; cd {shlex.quote(workdir)}\n"
+                  + "\n".join(run_cmds) + "\n" + epilogue)
+        print(f"[build] baking {len(run_cmds)} deferred RUN step(s) into "
+              f"{os.path.basename(overlay)} ({size_mb} MB sparse overlay, unshare -r)",
+              flush=True)
+        try:
+            _run_unshared([APPTAINER, "overlay", "create", "--sparse", "--size",
+                           str(size_mb), tmp], timeout=300)
+            _run_unshared([APPTAINER, "exec", "--overlay", tmp, "--cleanenv",
+                           "--pwd", "/", os.path.realpath(sif), "bash", "-lc", script])
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+        os.replace(tmp, overlay)
+    return overlay
 
 
 class ApptainerInstance:
@@ -282,6 +385,20 @@ class ApptainerInstance:
         os.makedirs(tests_dir, exist_ok=True)
         cmd.extend(["--bind", f"{tests_dir}:/tests:rw"])
 
+        # Registry-imported image with deferred RUN steps (see module top):
+        # its overlay is mounted read-only under the writable layer, and its
+        # COPY payload is staged from the workspace (the environment dir the
+        # driver sent) — the overlay was baked as namespace-root and cannot
+        # hold files the (possibly non-root) task must own.
+        self._deferred_overlay = None
+        self._deferred_spec = None
+        if resolved_sif and os.path.exists(_deferred_sidecar(resolved_sif)):
+            with open(_deferred_sidecar(resolved_sif)) as f:
+                self._deferred_spec = json.load(f)
+            self._deferred_overlay = _bake_deferred_overlay(resolved_sif)
+            if not getattr(self, "_dockerfile_workdir", None):
+                self._dockerfile_workdir = self._deferred_spec.get("workdir")
+
         # Bind a writable per-instance dir over the Dockerfile WORKDIR.
         # In apptainer setuid mode (MN5: no /etc/subuid mapping → no fakeroot),
         # the SIF's WORKDIR is owned by root:root and the calling user cannot
@@ -322,6 +439,36 @@ class ApptainerInstance:
             workdir_host = os.path.join(self.staging_dir, "workdir")
             os.makedirs(workdir_host, exist_ok=True)
             os.chmod(workdir_host, 0o777)
+            # Deferred image: replay the Dockerfile's COPY steps into the
+            # workdir (destinations under it) or as writable binds (others).
+            for copy_cmd in (self._deferred_spec or {}).get("copy") or []:
+                parts = shlex.split(copy_cmd)
+                if len(parts) < 2:
+                    continue
+                dest = parts[-1]
+                wd = dockerfile_workdir_for_bind.rstrip("/")
+                for src in parts[:-1]:
+                    src_abs = os.path.normpath(os.path.join(workspace, src))
+                    if not os.path.exists(src_abs):
+                        print(f"[{self.env_id}] COPY source not found: {src}", flush=True)
+                        continue
+                    if dest == wd or dest.startswith(wd + "/"):
+                        rel = dest[len(wd):].lstrip("/")
+                        target = os.path.join(workdir_host, rel) if rel else workdir_host
+                        if os.path.isdir(src_abs):
+                            shutil.copytree(src_abs, target, dirs_exist_ok=True)
+                        else:
+                            os.makedirs(os.path.dirname(target) or target, exist_ok=True)
+                            shutil.copy2(src_abs, target)
+                    else:
+                        stage = os.path.join(self.staging_dir, "deferred_copy",
+                                             dest.strip("/").replace("/", "_"))
+                        if os.path.isdir(src_abs):
+                            shutil.copytree(src_abs, stage, dirs_exist_ok=True)
+                        else:
+                            os.makedirs(os.path.dirname(stage), exist_ok=True)
+                            shutil.copy2(src_abs, stage)
+                        cmd.extend(["--bind", f"{stage}:{dest}:rw"])
             # Pre-populate from SIF's workdir if non-empty. Bind workdir_host
             # at a separate container path and cp inside; the real bind below
             # will then expose those files at the workdir, writable.
@@ -446,6 +593,9 @@ class ApptainerInstance:
             )
             cmd.extend(["--bind", f"{pc_conf}:/etc/proxychains.conf:ro"])
 
+        ro_overlay = (["--overlay", f"{self._deferred_overlay}:ro"]
+                      if self._deferred_overlay else [])
+
         cmd.extend([resolved_sif, self.instance_name])
 
         # Throttle concurrent singularity instance start calls (see module top).
@@ -470,8 +620,24 @@ class ApptainerInstance:
         with _INSTANCE_START_SEM:
             for i, use_fakeroot in enumerate(attempts):
                 start_cmd = list(cmd)
+                if not use_fakeroot and "--home" in start_cmd:
+                    # Not root inside: /root in the image is unwritable for us,
+                    # but tasks/verifiers write there ($HOME, uv, pip, ...).
+                    # Bind a per-instance host dir at /root, seeded with the
+                    # image's /root contents, so HOME stays /root and writable.
+                    hi = start_cmd.index("--home")
+                    if start_cmd[hi + 1] == "/root":
+                        home_host = os.path.join(self.staging_dir, "home")
+                        if not os.path.isdir(home_host):
+                            os.makedirs(home_host, exist_ok=True)
+                            subprocess.run(
+                                [APPTAINER, "exec", "--bind", f"{home_host}:/_home_init:rw",
+                                 resolved_sif, "sh", "-c",
+                                 "cp -a /root/. /_home_init/ 2>/dev/null || true"],
+                                capture_output=True, text=True, timeout=120)
+                        start_cmd[hi + 1] = f"{home_host}:/root"
                 # overlay goes right before the image + instance name
-                start_cmd[-2:-2] = _overlay_args(use_fakeroot)
+                start_cmd[-2:-2] = ro_overlay + _overlay_args(use_fakeroot)
                 if use_fakeroot:
                     start_cmd.insert(3, "--fakeroot")
                 result = subprocess.run(
@@ -482,8 +648,9 @@ class ApptainerInstance:
                     break
                 if i + 1 < len(attempts):
                     print(
-                        f"[{self.env_id}] Instance start with --fakeroot failed, "
-                        f"retrying without: {result.stderr.strip()[-300:]}",
+                        f"[{self.env_id}] WARNING: instance start with --fakeroot "
+                        f"failed, retrying WITHOUT root (tasks needing root at task "
+                        f"time will fail): {result.stderr.strip()[-300:]}",
                         flush=True,
                     )
         if result.returncode != 0:
@@ -558,7 +725,7 @@ class ApptainerInstance:
             APPTAINER,
             "exec",
             f"instance://{self.instance_name}",
-            "/usr/bin/bash",
+            "/bin/bash",
             "-c",
             (proxy_prefix if proxy_prefix else "") + ensure_script,
         ]
@@ -593,7 +760,12 @@ class ApptainerInstance:
                     print(f"[{self.env_id}] RUN cmd {i} timed out: {cmd_str[:80]}")
             self._pending_run_commands = []
 
-        return {"sif": resolved_sif, "instance": self.instance_name}
+        return {
+            "sif": resolved_sif,
+            "instance": self.instance_name,
+            "fakeroot": bool(getattr(self, "_fakeroot", False)),
+            "deferred_overlay": bool(self._deferred_overlay),
+        }
 
     def _extract_run_commands(self, workspace):
         """Extract RUN commands from Dockerfile that aren't baked into the base SIF.
@@ -635,8 +807,21 @@ class ApptainerInstance:
         env_vars = {}
         workdir = "/workspace"
 
-        for line in content.splitlines():
-            line = line.strip()
+        # Join backslash-continued lines first: a multi-line RUN would
+        # otherwise be truncated to its first line (e.g. "apt-get install -y \\").
+        logical_lines, pending = [], ""
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            if pending:
+                stripped = pending + " " + stripped
+                pending = ""
+            if stripped.endswith("\\"):
+                pending = stripped[:-1].rstrip()
+                continue
+            logical_lines.append(stripped)
+        if pending:
+            logical_lines.append(pending)
+        for line in logical_lines:
             if not line or line.startswith("#"):
                 continue
             upper = line.upper()
@@ -658,6 +843,20 @@ class ApptainerInstance:
                 workdir = line[8:].strip()
 
         def_content = f"Bootstrap: docker\nFrom: {base_image}\n\n"
+        # Docker's COPY steps: put the build-context files into the image
+        # (%files). Without this every COPY is silently dropped and tasks
+        # whose files live outside /workspace (e.g. "COPY task_file
+        # /app/task_file") start without their inputs.
+        context = os.path.dirname(os.path.abspath(dockerfile_path))
+        copies = _parse_copies(dockerfile_path)
+        files_lines = []
+        for sources, dest in copies:
+            for src in sources:
+                src_abs = os.path.normpath(os.path.join(context, src))
+                if os.path.exists(src_abs):
+                    files_lines.append(f"    {src_abs} {dest}")
+        if files_lines:
+            def_content += "%files\n" + "\n".join(files_lines) + "\n\n"
         if env_vars:
             def_content += "%environment\n"
             for k, v in env_vars.items():
@@ -697,7 +896,25 @@ class ApptainerInstance:
                     return output_sif
                 if os.path.exists(tmp_sif):
                     os.unlink(tmp_sif)
-            raise RuntimeError(f"SIF build failed: {result.stderr[:500]}")
+            build_err = result.stderr.strip()[-300:]
+            print(f"[build] Dockerfile build failed for {os.path.basename(output_sif)} "
+                  f"({build_err}); importing docker://{base_image} and deferring "
+                  f"{len(run_cmds)} RUN step(s) to a baked overlay", flush=True)
+            imp = subprocess.run([APPTAINER, "build", tmp_sif, f"docker://{base_image}"],
+                                 capture_output=True, text=True, timeout=1800)
+            if imp.returncode != 0:
+                if os.path.exists(tmp_sif):
+                    os.unlink(tmp_sif)
+                raise RuntimeError(f"SIF build failed: {build_err}; base image import "
+                                   f"also failed: {imp.stderr[-300:]}")
+            os.rename(tmp_sif, output_sif)
+            with open(_deferred_sidecar(output_sif), "w") as f:
+                json.dump({"run": run_cmds, "env": env_vars, "workdir": workdir,
+                           "base_image": base_image,
+                           "copy": [" ".join(src + [dest]) for src, dest in copies]},
+                          f, indent=2)
+            _bake_deferred_overlay(output_sif)
+            return output_sif
         finally:
             os.unlink(def_path)
 
@@ -933,14 +1150,14 @@ class ApptainerInstance:
         for k, v in env_vars.items():
             cmd.extend(["--env", f"{k}={shlex.quote(v)}"])
         cmd.append(f"instance://{self.instance_name}")
-        cmd.extend(["/usr/bin/bash", "-lc", command])
+        cmd.extend(["/bin/bash", "-lc", command])
 
         if "tmux" in command and "-V" in command:
             dbg_cmd = [
                 APPTAINER,
                 "exec",
                 f"instance://{self.instance_name}",
-                "/usr/bin/bash",
+                "/bin/bash",
                 "-lc",
                 "ls -la /usr/bin/tmux /usr/local/bin/tmux 2>&1; file /usr/bin/tmux 2>&1; /usr/bin/tmux -V 2>&1",
             ]
@@ -959,6 +1176,14 @@ class ApptainerInstance:
                 text=True,
                 timeout=timeout_sec if timeout_sec else 600,
             )
+            if result.returncode == 255:
+                # apptainer itself failed to run the exec (instance gone,
+                # bad --pwd, mount error, ...) — log it, the caller only sees rc.
+                print(
+                    f"[{self.env_id}] exec rc=255: {' '.join(cmd[:-1])[:400]} | "
+                    f"stderr: {result.stderr.strip()[-600:]}",
+                    flush=True,
+                )
             stdout = result.stdout[:50000] if result.stdout else ""
             stderr = result.stderr[:50000] if result.stderr else ""
             # Filter proxychains noise from output — these lines confuse
@@ -1142,7 +1367,7 @@ class ApptainerInstance:
             APPTAINER,
             "exec",
             f"instance://{self.instance_name}",
-            "/usr/bin/bash",
+            "/bin/bash",
             "-c",
             "pkill -9 -P 1 2>/dev/null; "
             "MYUID=$(id -u); "
