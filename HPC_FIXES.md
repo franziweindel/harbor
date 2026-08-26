@@ -110,12 +110,9 @@ reward 1 with 19/19 of its tests passing.
 
 ## 8. SIF cache location
 
-The cache is required, not an optimisation: the trial wraps the whole
-environment build in the task's `build_timeout_sec` (`[environment]` in
-`task.toml`, 600 s if the task sets none). Converting the Dockerfile to a
-SIF with Apptainer and running its `apt`/`pip` steps on a compute node often
-takes longer than that, so an uncached task fails its build before the agent
-starts; with a cached SIF the start takes seconds.
+On HPC, without cached images, tasks that set a `build_timeout_sec` in their
+`task.toml` (600 s if unset) time out in the Apptainer build of the Dockerfile
+before the agent starts. Either cache the SIFs or raise the timeout.
 
 The cache path was hard-coded to `~/.apptainer/harbor_cache`, so the only way
 onto cluster storage was a symlink — one fixed target for every job. On ZIH
