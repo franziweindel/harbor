@@ -360,23 +360,32 @@ class ApptainerInstance:
         # a directory overlay ("only root user can use sandbox as overlay in
         # setuid mode"). An overlay image file is allowed and gives the same
         # writable layer without size limits of --writable-tmpfs.
+        # The overlay is chosen per start attempt (see the fakeroot loop
+        # below): with --fakeroot a DIRECTORY overlay on node-local disk is the
+        # one that works (kernel overlayfs inside the user namespace; an ext3
+        # image mounted there is owned by the real uid and namespace-root
+        # cannot write its upper dir: "overlay upper dir ... is not writable").
+        # Without fakeroot the ext3 image is kept, as before.
         overlay_img = os.path.join(self.staging_dir, "overlay.img")
-        if not os.path.isfile(overlay_img):
-            mk = subprocess.run(
-                [APPTAINER, "overlay", "create", "--size", "4096", overlay_img],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if mk.returncode != 0:
-                # Fallback: directory overlay (works for fakeroot/userns)
-                overlay_dir = os.path.join(self.staging_dir, "overlay")
+        overlay_dir = os.path.join(self.staging_dir, "overlay")
+
+        def _overlay_args(use_fakeroot):
+            if use_fakeroot:
                 os.makedirs(overlay_dir, exist_ok=True)
-                cmd.extend(["--overlay", overlay_dir])
-            else:
-                cmd.extend(["--overlay", overlay_img])
-        else:
-            cmd.extend(["--overlay", overlay_img])
+                return ["--overlay", overlay_dir]
+            if not os.path.isfile(overlay_img):
+                mk = subprocess.run(
+                    [APPTAINER, "overlay", "create", "--size", "4096", overlay_img],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if mk.returncode != 0:
+                    # Fallback: directory overlay (works for fakeroot/userns)
+                    os.makedirs(overlay_dir, exist_ok=True)
+                    return ["--overlay", overlay_dir]
+            return ["--overlay", overlay_img]
+
         cmd.extend(["--cleanenv"])
         # Optional host-side agent_tools dir bind-mounted into container at the
         # SAME path so venv shebangs resolve. Provides uv, pytest, swebench,
@@ -442,8 +451,41 @@ class ApptainerInstance:
         # Throttle concurrent singularity instance start calls (see module top).
         # On clusters without subuid mappings (MN5), apptainer uses SUID starter
         # which has shared kernel state and breaks at high concurrency.
+        #
+        # Root inside the instance: Docker runs tasks as root, so verifiers and
+        # solutions call apt-get/dpkg/pip freely. Rootless apptainer runs them
+        # as the calling user and `dpkg` refuses ("requested operation requires
+        # superuser privilege") — every such task scores 0 even though the
+        # command "ran". `--fakeroot` on instance start restores root-like
+        # behaviour for everything exec'd into the instance (execs join its
+        # namespace, so they need no flag). BRIDGE_USE_FAKEROOT: "1" always,
+        # "0" never, "auto" (default) try with and fall back without, for
+        # images whose old libraries cannot load apptainer's fakeroot helper.
+        fakeroot_mode = os.environ.get("BRIDGE_USE_FAKEROOT", "auto").lower()
+        attempts = (
+            [True] if fakeroot_mode in ("1", "true", "yes")
+            else [False] if fakeroot_mode in ("0", "false", "no")
+            else [True, False]
+        )
         with _INSTANCE_START_SEM:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            for i, use_fakeroot in enumerate(attempts):
+                start_cmd = list(cmd)
+                # overlay goes right before the image + instance name
+                start_cmd[-2:-2] = _overlay_args(use_fakeroot)
+                if use_fakeroot:
+                    start_cmd.insert(3, "--fakeroot")
+                result = subprocess.run(
+                    start_cmd, capture_output=True, text=True, timeout=300
+                )
+                if result.returncode == 0:
+                    self._fakeroot = use_fakeroot
+                    break
+                if i + 1 < len(attempts):
+                    print(
+                        f"[{self.env_id}] Instance start with --fakeroot failed, "
+                        f"retrying without: {result.stderr.strip()[-300:]}",
+                        flush=True,
+                    )
         if result.returncode != 0:
             raise RuntimeError(f"Instance start failed: {result.stderr}")
 
@@ -472,6 +514,18 @@ class ApptainerInstance:
             ensure_workdir
             + "echo 'precedence ::ffff:0:0/96 100' > /etc/gai.conf 2>/dev/null; "
         )
+        if getattr(self, "_fakeroot", False):
+            # Single-uid user namespace: apt's privilege drop to _apt fails and
+            # its _apt-owned mode-700 partial/ dirs are unwritable even for
+            # namespace-root. Run apt as root with fresh download dirs.
+            ensure_script += (
+                "if command -v apt-get >/dev/null 2>&1; then "
+                "mkdir -p /apt-rootless/archives/partial /apt-rootless/lists/partial; "
+                "printf 'APT::Sandbox::User \"root\";\nDir::Cache::Archives "
+                "\"/apt-rootless/archives/\";\nDir::State::Lists "
+                "\"/apt-rootless/lists/\";\n' > /etc/apt/apt.conf.d/90-rootless 2>/dev/null; "
+                "fi; "
+            )
         if have_agent_tools:
             # agent_tools provides tmux + asciinema + uv + pytest via bind mount,
             # no internet-dependent install needed. Just symlink tmux so
