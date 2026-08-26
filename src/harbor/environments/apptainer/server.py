@@ -85,9 +85,15 @@ def _submit_job(env_id, job_type, payload=None):
         # START jobs or no worker assigned yet → general queue
         _job_queue.append(job_id)
     else:
-        # Route to the node that owns this env
-        # worker_id is like "jwc07n056-3", node_id is "jwc07n056"
-        node_id = worker_id.rsplit("-", 1)[0] if "-" in worker_id else worker_id
+        # Route to the node that owns this env: the queue key the node's
+        # dispatcher polls with, recorded when it picked up the START job
+        # (env["node_id"]). Re-deriving it here from worker_id with
+        # rsplit("-") assumed a "host-N" shape and broke on any hostname
+        # containing a dash (e.g. an FQDN like julia.hpc.tu-dresden.de):
+        # jobs were queued under a key nobody polled and timed out.
+        node_id = env.get("node_id") or (
+            worker_id.rsplit("-", 1)[0] if "-" in worker_id else worker_id
+        )
         if node_id not in _worker_queues:
             _worker_queues[node_id] = deque()
         _worker_queues[node_id].append(job_id)
@@ -303,6 +309,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if env and job["type"] == JOB_START:
                     env["state"] = ENV_STARTING
                     env["worker_id"] = worker_id
+                    env["node_id"] = node_id
 
                 self._json(
                     {
@@ -340,6 +347,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     if env and job["type"] == JOB_START:
                         env["state"] = ENV_STARTING
                         env["worker_id"] = node_id
+                        env["node_id"] = node_id
                     jobs_out.append(
                         {
                             "job_id": job_id,
@@ -363,6 +371,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     if env and job["type"] == JOB_START:
                         env["state"] = ENV_STARTING
                         env["worker_id"] = node_id
+                        env["node_id"] = node_id
                     jobs_out.append(
                         {
                             "job_id": job_id,
